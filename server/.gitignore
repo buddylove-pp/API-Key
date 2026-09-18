@@ -8,3 +8,5 @@ dist/
 keys/
 coverage/
 *.log
+
+.deploy-payload.json

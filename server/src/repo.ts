@@ -249,15 +249,25 @@ export class MemoryRepo implements Repo {
 
 export class PgRepo implements Repo {
   private pool: pg.Pool;
+  private sslEnabled: boolean;
+  private readonly connectionString: string;
 
-  constructor(connectionString: string) {
-    this.pool = new pg.Pool({
+  constructor(connectionString: string, sslMode: "auto" | "disable" | "require" = "auto") {
+    this.connectionString = connectionString;
+    // auto：URL 里写了 sslmode=disable 就不开 SSL，否则开
+    this.sslEnabled = sslMode === "require"
+      || (sslMode === "auto" && !/sslmode=disable/.test(connectionString));
+
+    this.pool = this.makePool(connectionString, this.sslEnabled);
+  }
+
+  private makePool(connectionString: string, ssl: boolean): pg.Pool {
+    return new pg.Pool({
       connectionString,
       max: 5,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
-      // 托管数据库通常要求 TLS；本地/内网可放宽
-      ssl: /sslmode=disable/.test(connectionString) ? false : { rejectUnauthorized: false },
+      ssl: ssl ? { rejectUnauthorized: false } : false,
     });
   }
 
@@ -266,7 +276,27 @@ export class PgRepo implements Repo {
     // 编译后 dist/repo.js → ../sql/schema.sql
     const schemaPath = join(here, "..", "sql", "schema.sql");
     const sql = readFileSync(schemaPath, "utf8");
-    await this.pool.query(sql);
+
+    try {
+      await this.pool.query(sql);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // 托管平台的内网数据库通常不支持 SSL，而外部数据库通常强制 SSL。
+      // 与其让用户猜该不该开，不如按错误自动降级重试一次。
+      const sslMismatch = /does not support SSL/i.test(msg)
+        || /SSL required/i.test(msg)
+        || /no pg_hba.conf entry/i.test(msg);
+
+      if (!sslMismatch || this.connectionString === "") throw e;
+
+      const retrySsl = !this.sslEnabled;
+      console.warn(`[db] 连接失败（${msg}），改用 ssl=${retrySsl} 重试`);
+
+      await this.pool.end().catch(() => undefined);
+      this.sslEnabled = retrySsl;
+      this.pool = this.makePool(this.connectionString, retrySsl);
+      await this.pool.query(sql);
+    }
   }
 
   async close(): Promise<void> {
