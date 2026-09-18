@@ -1,0 +1,180 @@
+<Window x:Class="LicenseTester.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="卡密授权测试客户端" Height="760" Width="780"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Microsoft YaHei UI, Segoe UI" FontSize="13"
+        Background="White">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16">
+        <StackPanel>
+
+            <!-- ============ 服务端配置 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="服务端配置" Style="{StaticResource SectionTitle}" />
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="服务器地址" Style="{StaticResource Label}" />
+                        <TextBox x:Name="TxtServer" Grid.Column="1"
+                                 Text="http://localhost:8080" />
+                    </Grid>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="软件标识" Style="{StaticResource Label}" />
+                        <TextBox x:Name="TxtProduct" Grid.Column="1" Text="license-tester" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ============ 激活 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="卡密激活" Style="{StaticResource SectionTitle}" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="卡密" Style="{StaticResource Label}" />
+                        <TextBox x:Name="TxtLicenseKey" Grid.Column="1"
+                                 FontFamily="Consolas, Cascadia Mono" FontSize="14"
+                                 CharacterCasing="Upper"
+                                 ToolTip="支持带或不带横线，大小写不敏感，O/I/L 会自动纠正" />
+                        <Button x:Name="BtnActivate" Grid.Column="2" Content="激活"
+                                Background="{StaticResource Accent}" Foreground="White"
+                                BorderThickness="0" FontWeight="SemiBold"
+                                Click="BtnActivate_Click" />
+                    </Grid>
+                    <TextBlock x:Name="TxtActivateHint" Margin="90,8,0,0"
+                               Foreground="{StaticResource Muted}" TextWrapping="Wrap"
+                               Text="提示：卡密需与「软件标识」匹配，跨软件使用会被服务端拒绝。" />
+                </StackPanel>
+            </Border>
+
+            <!-- ============ 授权状态 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="授权状态" Style="{StaticResource SectionTitle}" />
+
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="设备指纹" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtFingerprint" Grid.Column="1"
+                                   FontFamily="Consolas, Cascadia Mono"
+                                   VerticalAlignment="Center" TextWrapping="Wrap" />
+                        <Button x:Name="BtnCopyFp" Grid.Column="2" Content="复制"
+                                Click="BtnCopyFp_Click" Margin="8,0,0,0" />
+                    </Grid>
+
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="状态" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtStatus" Grid.Column="1" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" Text="未激活" />
+                    </Grid>
+
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="到期时间" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtExpiry" Grid.Column="1"
+                                   VerticalAlignment="Center" Text="—" />
+                    </Grid>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="剩余" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtDaysLeft" Grid.Column="1"
+                                   VerticalAlignment="Center" Text="—" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ============ 操作 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="操作" Style="{StaticResource SectionTitle}" />
+                    <WrapPanel>
+                        <Button x:Name="BtnVerify" Content="本地验签" Click="BtnVerify_Click" />
+                        <Button x:Name="BtnHeartbeat" Content="心跳续期" Click="BtnHeartbeat_Click" />
+                        <Button x:Name="BtnUnbind" Content="解绑本设备" Click="BtnUnbind_Click" />
+                        <Button x:Name="BtnClear" Content="清除本地票据" Click="BtnClear_Click" />
+                        <Button x:Name="BtnDetail" Content="查看采集明细" Click="BtnDetail_Click" />
+                    </WrapPanel>
+                    <TextBlock x:Name="TxtHint" Margin="0,10,0,0"
+                               Foreground="{StaticResource Muted}" TextWrapping="Wrap"
+                               Text="「本地验签」不联网，纯离线验证票据真伪 —— 这是客户端授权的信任根。" />
+                </StackPanel>
+            </Border>
+
+            <!-- ============ 验签公钥 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="验签公钥" Style="{StaticResource SectionTitle}" />
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="key_id" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtKeyId" Grid.Column="1"
+                                   FontFamily="Consolas, Cascadia Mono"
+                                   VerticalAlignment="Center" Text="—" />
+                        <Button x:Name="BtnFetchKey" Grid.Column="2" Content="从服务端获取"
+                                Click="BtnFetchKey_Click" Margin="8,0,0,0" />
+                    </Grid>
+                    <TextBlock Foreground="{StaticResource ErrBrush}" TextWrapping="Wrap"
+                               Text="⚠️ 测试客户端为了方便从服务端拉取公钥；正式软件必须把公钥硬编码进客户端，否则中间人可以替换公钥伪造授权。" />
+                </StackPanel>
+            </Border>
+
+            <!-- ============ 日志 ============ -->
+            <Border Background="{StaticResource PanelBg}" BorderBrush="{StaticResource Line}"
+                    BorderThickness="1" CornerRadius="6" Padding="12">
+                <StackPanel>
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="日志" Style="{StaticResource SectionTitle}" Margin="0" />
+                        <Button Grid.Column="1" Content="清空" Click="BtnClearLog_Click"
+                                Padding="10,2" Margin="0" />
+                    </Grid>
+                    <TextBox x:Name="TxtLog" Height="180" IsReadOnly="True"
+                             AcceptsReturn="True" TextWrapping="NoWrap"
+                             VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto"
+                             FontFamily="Consolas, Cascadia Mono" FontSize="12"
+                             Background="White" />
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</Window>

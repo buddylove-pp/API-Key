@@ -1,0 +1,27 @@
+{
+  "name": "license-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "卡密授权验证服务 — 签发 ECDsa 签名票据，客户端离线验签",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "node --experimental-strip-types src/index.ts",
+    "gen-keys": "node scripts/gen-keys.mjs",
+    "test": "node test/e2e.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2"
+  }
+}
