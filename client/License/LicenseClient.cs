@@ -16,7 +16,7 @@ public sealed class LicenseClient
         Timeout = TimeSpan.FromSeconds(20),
     };
 
-    public string BaseUrl { get; set; } = "http://localhost:8080";
+    public string BaseUrl { get; set; } = "https://api-key.orkestr.run";
     public string Product { get; set; } = "license-tester";
 
     // ---------- 公共接口 ----------
@@ -33,6 +33,28 @@ public sealed class LicenseClient
 
     public Task<ApiResponse<TicketData>> HeartbeatAsync(string ticket, string deviceFp)
         => PostAsync<TicketData>("/api/v1/heartbeat", new
+        {
+            ticket,
+            device_fp = deviceFp,
+            app_version = "1.0.0",
+        });
+
+    /// <summary>
+    /// 执行定期校验，推进校验周期。
+    /// 与心跳的区别：心跳只续票据，校验会推进排期。
+    /// 校验不消耗卡密的激活次数。
+    /// </summary>
+    public Task<ApiResponse<CheckData>> CheckAsync(string ticket, string deviceFp)
+        => PostAsync<CheckData>("/api/v1/check", new
+        {
+            ticket,
+            device_fp = deviceFp,
+            app_version = "1.0.0",
+        });
+
+    /// <summary>只读查询授权状态，不推进排期。用来判断该不该弹校验窗口</summary>
+    public Task<ApiResponse<EntitlementInfo>> GetEntitlementAsync(string ticket, string deviceFp)
+        => PostAsync<EntitlementInfo>("/api/v1/entitlement", new
         {
             ticket,
             device_fp = deviceFp,

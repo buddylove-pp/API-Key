@@ -151,6 +151,30 @@ ALTER TABLE bindings ADD COLUMN IF NOT EXISTS overdue_since          BIGINT;
 
 ALTER TABLE admin_tokens ADD COLUMN IF NOT EXISTS owner_username TEXT;
 
+-- ============ 一次性迁移标记表 ============
+-- 用来记录"某个一次性迁移已经跑过"，避免每次部署重复执行。
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT   NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+
+-- 一次性清理：旧版本没有 owner_username 列，无法区分
+-- 「账户登录的会话令牌」和「手动签发的下级令牌」，这些令牌一律撤销。
+-- 用户重新登录即可拿到带归属的新令牌。
+--
+-- ⚠️ 必须只执行一次：否则每次部署都会把用户新签发的令牌一起撤销。
+--    这里的 NOT EXISTS 是**非关联**子查询，只求值一次 ——
+--    标记不存在时整条 UPDATE 生效，存在时影响 0 行。
+UPDATE admin_tokens
+   SET revoked = TRUE
+ WHERE owner_username IS NULL
+   AND NOT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'revoke_legacy_tokens_v1');
+
+INSERT INTO schema_meta (key, value, updated_at)
+VALUES ('revoke_legacy_tokens_v1', 'done', EXTRACT(EPOCH FROM NOW())::BIGINT)
+ON CONFLICT (key) DO NOTHING;
+
 -- 依赖新列的索引，必须放在 ALTER 之后
 CREATE INDEX IF NOT EXISTS idx_bindings_next_check ON bindings (next_check_at);
 

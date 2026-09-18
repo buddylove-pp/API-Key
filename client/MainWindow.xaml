@@ -20,7 +20,7 @@
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="服务器地址" Style="{StaticResource Label}" />
                         <TextBox x:Name="TxtServer" Grid.Column="1"
-                                 Text="http://localhost:8080" />
+                                 Text="https://api-key.orkestr.run" />
                     </Grid>
                     <Grid>
                         <Grid.ColumnDefinitions>
@@ -87,7 +87,7 @@
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="状态" Style="{StaticResource Label}" />
                         <TextBlock x:Name="TxtStatus" Grid.Column="1" FontWeight="SemiBold"
-                                   VerticalAlignment="Center" Text="未激活" />
+                                   VerticalAlignment="Center" Text="未激活" TextWrapping="Wrap" />
                     </Grid>
 
                     <Grid Margin="0,0,0,6">
@@ -95,12 +95,12 @@
                             <ColumnDefinition Width="90" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
-                        <TextBlock Text="到期时间" Style="{StaticResource Label}" />
-                        <TextBlock x:Name="TxtExpiry" Grid.Column="1"
+                        <TextBlock Text="授权期" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtEntitlement" Grid.Column="1"
                                    VerticalAlignment="Center" Text="—" />
                     </Grid>
 
-                    <Grid>
+                    <Grid Margin="0,0,0,6">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="90" />
                             <ColumnDefinition Width="*" />
@@ -108,6 +108,40 @@
                         <TextBlock Text="剩余" Style="{StaticResource Label}" />
                         <TextBlock x:Name="TxtDaysLeft" Grid.Column="1"
                                    VerticalAlignment="Center" Text="—" />
+                    </Grid>
+
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="定期校验" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtCheckPlan" Grid.Column="1"
+                                   VerticalAlignment="Center" Text="—" TextWrapping="Wrap" />
+                    </Grid>
+
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="下次校验" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtNextCheck" Grid.Column="1"
+                                   VerticalAlignment="Center" Text="—" TextWrapping="Wrap" />
+                    </Grid>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="时间校验" Style="{StaticResource Label}" />
+                        <TextBlock x:Name="TxtTimeGuard" Grid.Column="1"
+                                   VerticalAlignment="Center" Text="—" TextWrapping="Wrap" />
+                        <Button x:Name="BtnMuteRemind" Grid.Column="2" Content="关闭提前提醒"
+                                Click="BtnMuteRemind_Click" Margin="8,0,0,0"
+                                ToolTip="关闭后不再弹提前提醒，但到校验期仍会强制要求校验" />
                     </Grid>
                 </StackPanel>
             </Border>
@@ -119,14 +153,17 @@
                     <TextBlock Text="操作" Style="{StaticResource SectionTitle}" />
                     <WrapPanel>
                         <Button x:Name="BtnVerify" Content="本地验签" Click="BtnVerify_Click" />
+                        <Button x:Name="BtnCheck" Content="执行校验" Click="BtnCheck_Click" />
                         <Button x:Name="BtnHeartbeat" Content="心跳续期" Click="BtnHeartbeat_Click" />
                         <Button x:Name="BtnUnbind" Content="解绑本设备" Click="BtnUnbind_Click" />
                         <Button x:Name="BtnClear" Content="清除本地票据" Click="BtnClear_Click" />
                         <Button x:Name="BtnDetail" Content="查看采集明细" Click="BtnDetail_Click" />
+                        <Button x:Name="BtnSimulate" Content="模拟时间回拨" Click="BtnSimulate_Click"
+                                ToolTip="把时间锚点往前挪 2 小时，模拟用户改了系统时间，用于验证回拨检测是否生效" />
                     </WrapPanel>
                     <TextBlock x:Name="TxtHint" Margin="0,10,0,0"
                                Foreground="{StaticResource Muted}" TextWrapping="Wrap"
-                               Text="「本地验签」不联网，纯离线验证票据真伪 —— 这是客户端授权的信任根。" />
+                               Text="「本地验签」不联网，纯离线验证票据真伪 —— 这是客户端授权的信任根。「执行校验」会联网并推进校验周期。" />
                 </StackPanel>
             </Border>
 

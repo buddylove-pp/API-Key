@@ -685,7 +685,12 @@
     var me = state.me;
     $("roleBadge").textContent = me.role_label || me.role;
     $("roleBadge").className = "tag " + me.role;
-    $("whoami").textContent = me.name + " · " + (me.role_desc || "");
+
+    // 令牌登录时说明为什么看不到令牌管理，避免用户以为是界面坏了
+    var suffix = "";
+    if (me.source === "token") suffix = "（令牌登录 · 无法管理令牌）";
+    else if (me.source === "static") suffix = "（静态令牌登录 · 无法管理令牌）";
+    $("whoami").textContent = me.name + " · " + (me.role_desc || "") + suffix;
 
     // 只有「账户密码登录」能管理令牌 —— 令牌不能派生令牌。
     // 用令牌登录时这个页签直接不显示，避免误以为可以签发。
