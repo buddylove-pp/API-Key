@@ -21,8 +21,18 @@ async function main(): Promise<void> {
   const publicKey = derivePublicKey(privateKey);
 
   const repo = createRepo(config.dbDriver, config.databaseUrl);
+
+  // 建表/连库失败不直接退出：让进程活着，/health 会报出真实原因。
+  // 否则容器一崩，平台只会给一句 "App check failed"，根因完全看不到。
+  let initError: string | null = null;
   if (config.autoMigrate) {
-    await repo.init();
+    try {
+      await repo.init();
+      console.log("[db] 建表完成");
+    } catch (e) {
+      initError = e instanceof Error ? e.message : String(e);
+      console.error("[db] 建表失败:", initError);
+    }
   }
 
   const service = new LicenseService(repo, privateKey, publicKey);
@@ -58,6 +68,12 @@ async function main(): Promise<void> {
     adminToken: config.adminToken,
     rateLimitMax: config.rateLimitMax,
     rateLimitWindowSec: config.rateLimitWindowSec,
+    health: () => ({
+      db_driver: config.dbDriver,
+      database_url_set: config.databaseUrl !== "",
+      auto_migrate: config.autoMigrate,
+      init_error: initError,
+    }),
   }));
 
   const server = app.listen(config.port, () => {

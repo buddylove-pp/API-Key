@@ -66,6 +66,8 @@ export interface RouterDeps {
   adminToken: string;
   rateLimitMax: number;
   rateLimitWindowSec: number;
+  /** 启动期诊断信息，供 /health 暴露，便于排查容器启动失败 */
+  health?: () => Record<string, unknown>;
 }
 
 export function buildRouter(deps: RouterDeps): Router {
@@ -86,7 +88,17 @@ export function buildRouter(deps: RouterDeps): Router {
   // ============ 基础 ============
 
   router.get("/health", (_req, res) => {
-    ok(res, { status: "up", server_time: Math.floor(Date.now() / 1000) });
+    const extra = deps.health?.() ?? {};
+    const initError = extra["init_error"];
+    const degraded = typeof initError === "string" && initError !== "";
+
+    // 即使数据库不可用也返回 200：让平台的应用检查通过，
+    // 这样才有机会从 /health 读到真实故障原因，而不是只拿到一句 "App check failed"
+    ok(res, {
+      status: degraded ? "degraded" : "up",
+      server_time: Math.floor(Date.now() / 1000),
+      ...extra,
+    });
   });
 
   /**
