@@ -195,6 +195,16 @@
           <input id="fQ" placeholder="卡密前 8 位或备注">
         </div>
         <button id="btnSearch" class="primary">查询</button>
+        <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:4px">
+          <input id="autoRefresh" type="checkbox" style="width:auto">
+          自动刷新
+        </label>
+        <select id="refreshSec" style="width:auto">
+          <option value="5">5 秒</option>
+          <option value="10" selected>10 秒</option>
+          <option value="30">30 秒</option>
+        </select>
+        <span id="lastUpdated" class="hint"></span>
       </div>
 
       <div id="listMsg" class="msg"></div>
@@ -421,6 +431,30 @@
     $("pageInfo").textContent = "第 " + state.page + " / " + pages + " 页，共 " + state.total + " 条";
     $("btnPrev").disabled = state.page <= 1;
     $("btnNext").disabled = state.page >= pages;
+    $("lastUpdated").textContent = "最后更新 " + new Date().toLocaleTimeString("zh-CN");
+  }
+
+  // ---------- 自动刷新 ----------
+
+  var refreshTimer = null;
+
+  function setAutoRefresh(on) {
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+    if (!on) {
+      $("lastUpdated").textContent = "";
+      return;
+    }
+    var sec = Number($("refreshSec").value) || 10;
+    refreshTimer = setInterval(function () {
+      // 详情弹窗打开时或不在列表页时不刷新，避免打断查看
+      if ($("detail").open) return;
+      if ($("secList").hidden) return;
+      loadList();
+    }, sec * 1000);
+    loadList();
   }
 
   function statusText(s) {
@@ -513,6 +547,8 @@
 
   $("btnGen").onclick = generate;
   $("btnSearch").onclick = function () { state.page = 1; loadList(); };
+  $("autoRefresh").onchange = function () { setAutoRefresh(this.checked); };
+  $("refreshSec").onchange = function () { if ($("autoRefresh").checked) setAutoRefresh(true); };
   $("btnPrev").onclick = function () { if (state.page > 1) { state.page--; loadList(); } };
   $("btnNext").onclick = function () { state.page++; loadList(); };
   $("btnCloseDetail").onclick = function () { $("detail").close(); };
