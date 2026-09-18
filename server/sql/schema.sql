@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS admin_tokens (
   created_at   BIGINT    NOT NULL,
   expires_at   BIGINT    NOT NULL,
   revoked      BOOLEAN   NOT NULL DEFAULT FALSE,
-  last_used_at BIGINT
+  last_used_at BIGINT,
+  -- 非空表示这是「账户密码登录」产生的会话令牌，归属该账户；
+  -- 为空表示这是管理员手动签发的下级令牌。
+  -- 只有前者能管理令牌 —— 令牌不能派生令牌。
+  owner_username TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_admin_tokens_hash ON admin_tokens (token_hash);
@@ -144,6 +148,8 @@ ALTER TABLE bindings ADD COLUMN IF NOT EXISTS last_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS next_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_state            TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS overdue_since          BIGINT;
+
+ALTER TABLE admin_tokens ADD COLUMN IF NOT EXISTS owner_username TEXT;
 
 -- 依赖新列的索引，必须放在 ALTER 之后
 CREATE INDEX IF NOT EXISTS idx_bindings_next_check ON bindings (next_check_at);

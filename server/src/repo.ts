@@ -74,6 +74,8 @@ export interface AdminTokenRow {
   expires_at: number;
   revoked: boolean;
   last_used_at: number | null;
+  /** 非空 = 账户登录的会话令牌，归属该账户；为空 = 手动签发的下级令牌 */
+  owner_username: string | null;
 }
 
 export interface LicenseRow {
@@ -151,6 +153,7 @@ export interface BindingEntitlement {
 }
 
 export interface AuditEntry {
+  id?: number;
   license_id: number | null;
   event: string;
   device_fp?: string | null;
@@ -158,6 +161,16 @@ export interface AuditEntry {
   app_version?: string | null;
   detail?: string | null;
   created_at: number;
+}
+
+/** 全局审计查询条件 */
+export interface AuditQuery {
+  /** 事件名前缀，如 admin. 或 license. */
+  eventPrefix?: string | undefined;
+  /** 精确事件名 */
+  event?: string | undefined;
+  page: number;
+  pageSize: number;
 }
 
 export interface CreateLicenseInput {
@@ -216,6 +229,8 @@ export interface Repo {
 
   audit(entry: AuditEntry): Promise<void>;
   listAudit(licenseId: number, limit: number): Promise<AuditEntry[]>;
+  /** 全局审计查询（管理端登录记录、令牌操作、卡密操作） */
+  listAuditGlobal(query: AuditQuery): Promise<{ rows: AuditEntry[]; total: number }>;
 
   // ---- 软件注册表 ----
   createProduct(input: CreateProductInput): Promise<ProductRow>;
@@ -236,11 +251,14 @@ export interface Repo {
   }): Promise<AdminUserRow>;
   findAdminUser(username: string): Promise<AdminUserRow | null>;
   touchAdminUserLogin(id: number, at: number): Promise<void>;
+  updateAdminPassword(id: number, passwordHash: string): Promise<void>;
 
   // ---- 管理员令牌 ----
   createAdminToken(input: {
     token_hash: string; token_prefix: string; name: string | null;
     role: AdminRole; created_by: string; created_at: number; expires_at: number;
+    /** 非空 = 账户登录的会话令牌 */
+    owner_username: string | null;
   }): Promise<AdminTokenRow>;
   findAdminTokenByHash(hash: string): Promise<AdminTokenRow | null>;
   listAdminTokens(): Promise<AdminTokenRow[]>;
@@ -264,6 +282,7 @@ export class MemoryRepo implements Repo {
   private nextProductId = 1;
   private nextAdminUserId = 1;
   private nextAdminTokenId = 1;
+  private nextAuditId = 1;
 
   async init(): Promise<void> {
     // 与 sql/schema.sql 的预置数据保持一致，让内存模式也能开箱即用
@@ -427,7 +446,7 @@ export class MemoryRepo implements Repo {
   }
 
   async audit(entry: AuditEntry): Promise<void> {
-    this.auditLog.push({ ...entry });
+    this.auditLog.push({ ...entry, id: this.nextAuditId++ });
   }
 
   async listAudit(licenseId: number, limit: number): Promise<AuditEntry[]> {
@@ -436,6 +455,16 @@ export class MemoryRepo implements Repo {
       .slice(-limit)
       .reverse()
       .map((a) => ({ ...a }));
+  }
+
+  async listAuditGlobal(query: AuditQuery): Promise<{ rows: AuditEntry[]; total: number }> {
+    let all = [...this.auditLog].reverse();
+    if (query.event) all = all.filter((a) => a.event === query.event);
+    if (query.eventPrefix) all = all.filter((a) => a.event.startsWith(query.eventPrefix!));
+
+    const total = all.length;
+    const start = (query.page - 1) * query.pageSize;
+    return { rows: all.slice(start, start + query.pageSize).map((a) => ({ ...a })), total };
   }
 
   // ---- 软件注册表 ----
@@ -542,11 +571,18 @@ export class MemoryRepo implements Repo {
     }
   }
 
+  async updateAdminPassword(id: number, passwordHash: string): Promise<void> {
+    for (const u of this.adminUsers.values()) {
+      if (u.id === id) u.password_hash = passwordHash;
+    }
+  }
+
   // ---- 管理员令牌 ----
 
   async createAdminToken(input: {
     token_hash: string; token_prefix: string; name: string | null;
     role: AdminRole; created_by: string; created_at: number; expires_at: number;
+    owner_username: string | null;
   }): Promise<AdminTokenRow> {
     const row: AdminTokenRow = {
       id: this.nextAdminTokenId++,
@@ -559,6 +595,7 @@ export class MemoryRepo implements Repo {
       expires_at: input.expires_at,
       revoked: false,
       last_used_at: null,
+      owner_username: input.owner_username,
     };
     this.adminTokens.set(row.id, row);
     return { ...row };
@@ -904,6 +941,35 @@ export class PgRepo implements Repo {
     return rows;
   }
 
+  async listAuditGlobal(query: AuditQuery): Promise<{ rows: AuditEntry[]; total: number }> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.event) {
+      params.push(query.event);
+      where.push(`event = $${params.length}`);
+    }
+    if (query.eventPrefix) {
+      params.push(`${query.eventPrefix}%`);
+      where.push(`event LIKE $${params.length}`);
+    }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const countRes = await this.pool.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM audit_log ${whereSql}`, params,
+    );
+
+    const listParams = [...params, query.pageSize, (query.page - 1) * query.pageSize];
+    const { rows } = await this.pool.query<AuditEntry>(
+      `SELECT * FROM audit_log ${whereSql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams,
+    );
+
+    return { rows, total: countRes.rows[0]?.n ?? 0 };
+  }
+
   // ---- 软件注册表 ----
 
   async createProduct(input: CreateProductInput): Promise<ProductRow> {
@@ -1007,20 +1073,26 @@ export class PgRepo implements Repo {
     await this.pool.query(`UPDATE admin_users SET last_login_at = $2 WHERE id = $1`, [id, at]);
   }
 
+  async updateAdminPassword(id: number, passwordHash: string): Promise<void> {
+    await this.pool.query(`UPDATE admin_users SET password_hash = $2 WHERE id = $1`, [id, passwordHash]);
+  }
+
   // ---- 管理员令牌 ----
 
   async createAdminToken(input: {
     token_hash: string; token_prefix: string; name: string | null;
     role: AdminRole; created_by: string; created_at: number; expires_at: number;
+    owner_username: string | null;
   }): Promise<AdminTokenRow> {
     const { rows } = await this.pool.query<AdminTokenRow>(
       `INSERT INTO admin_tokens
-         (token_hash, token_prefix, name, role, created_by, created_at, expires_at, revoked)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
+         (token_hash, token_prefix, name, role, created_by, created_at, expires_at,
+          revoked, owner_username)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,$8)
        RETURNING *`,
       [
         input.token_hash, input.token_prefix, input.name, input.role,
-        input.created_by, input.created_at, input.expires_at,
+        input.created_by, input.created_at, input.expires_at, input.owner_username,
       ],
     );
     return rows[0]!;

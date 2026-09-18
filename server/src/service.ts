@@ -16,7 +16,9 @@ import {
   TICKET_VERSION,
   type TicketPayload,
 } from "./crypto.js";
-import type { BindingRow, LicenseRow, ProductRow, ProductStatus, Repo } from "./repo.js";
+import type {
+  AuditQuery, BindingRow, LicenseRow, ProductRow, ProductStatus, Repo,
+} from "./repo.js";
 import {
   SECONDS_PER_DAY,
   advanceNextCheck,
@@ -787,6 +789,8 @@ export class LicenseService {
       created_by: username,
       created_at: now,
       expires_at: expiresAt,
+      // 标记为会话令牌 —— 只有这种身份能管理令牌
+      owner_username: username,
     });
     await this.repo.touchAdminUserLogin(user.id, now);
     await this.repo.audit({
@@ -813,6 +817,17 @@ export class LicenseService {
     // 顺手记录最近使用时间，便于后台看出哪些令牌还在被用
     await this.repo.touchAdminToken(row.id, now);
 
+    // owner_username 非空 = 账户密码登录产生的会话令牌。
+    // 只有这种身份能管理令牌 —— 令牌不能派生令牌。
+    if (row.owner_username !== null) {
+      return {
+        name: row.owner_username,
+        role: row.role,
+        source: "account",
+        username: row.owner_username,
+      };
+    }
+
     return { name: row.name ?? row.token_prefix, role: row.role, source: "token" };
   }
 
@@ -837,6 +852,8 @@ export class LicenseService {
       created_by: createdBy,
       created_at: now,
       expires_at: now + ttl,
+      // 手动签发的下级令牌，不是会话令牌
+      owner_username: null,
     });
 
     await this.repo.audit({
@@ -860,6 +877,80 @@ export class LicenseService {
       created_at: nowSec(),
     });
   }
+
+  /**
+   * 退出登录：撤销本次会话令牌。
+   *
+   * 每次账户登录都会新建一条会话令牌，退出时不撤销就会不断堆积，
+   * 留下大量仍然有效的最高权限凭据 —— 等于把风险敞口留在那里。
+   * 静态 ADMIN_TOKEN 不落库，直接忽略。
+   */
+  async logout(raw: string, ctx: CallContext): Promise<void> {
+    if (!raw.startsWith("adm_")) return;
+
+    const row = await this.repo.findAdminTokenByHash(hashAdminToken(raw));
+    if (!row || row.revoked) return;
+
+    await this.repo.revokeAdminToken(row.id);
+    await this.repo.audit({
+      license_id: null, event: "admin.logout",
+      detail: `user=${row.owner_username ?? row.created_by} token=${row.token_prefix}`,
+      ip: ctx.ip, created_at: nowSec(),
+    });
+  }
+
+  /** 撤销某账户的全部会话令牌（改密码后调用，把其它设备踢下线） */
+  async revokeSessionsOf(username: string, keepTokenHash: string | null): Promise<number> {
+    const rows = await this.repo.listAdminTokens();
+    let n = 0;
+    for (const t of rows) {
+      if (t.owner_username !== username) continue;
+      if (t.revoked) continue;
+      if (keepTokenHash !== null && t.token_hash === keepTokenHash) continue;
+      if (await this.repo.revokeAdminToken(t.id)) n++;
+    }
+    return n;
+  }
+
+  /** 修改账户密码。需原密码；成功后撤销该账户其它会话 */
+  async changePassword(
+    username: string,
+    oldPassword: string,
+    newPassword: string,
+    keepToken: string | null,
+    ctx: CallContext,
+  ): Promise<number> {
+    if (newPassword.length < 8) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const user = await this.repo.findAdminUser(username);
+    // 用户名不存在也走一次哈希，避免通过响应时间探测
+    const ok = verifyPassword(oldPassword, user?.password_hash ?? "scrypt$0$0$0$AAAA$AAAA");
+
+    if (!user || !ok || user.disabled) {
+      await this.repo.audit({
+        license_id: null, event: "admin.password.fail",
+        detail: `user=${username}`, ip: ctx.ip, created_at: nowSec(),
+      });
+      throw new ServiceError(ErrCode.AUTH_FAILED, 401);
+    }
+
+    await this.repo.updateAdminPassword(user.id, hashPassword(newPassword));
+
+    // 改完密码把其它会话踢掉：密码变更通常意味着怀疑泄露
+    const keepHash = keepToken === null ? null : hashAdminToken(keepToken);
+    const kicked = await this.revokeSessionsOf(username, keepHash);
+
+    await this.repo.audit({
+      license_id: null, event: "admin.password.change",
+      detail: `user=${username} kicked=${kicked}`, ip: ctx.ip, created_at: nowSec(),
+    });
+    return kicked;
+  }
+
+  /** 全局审计日志（登录记录、令牌操作、卡密操作） */
+  async listAuditGlobal(query: AuditQuery) {
+    return this.repo.listAuditGlobal(query);
+  }
 }
 
 /** 对外返回的令牌视图：不含哈希 */
@@ -875,12 +966,15 @@ export interface AdminTokenRowView {
   last_used_at: number | null;
   /** 是否已过期 */
   expired: boolean;
+  /** true = 账户登录的会话令牌；false = 手动签发的下级令牌 */
+  is_session: boolean;
+  owner_username: string | null;
 }
 
 function toTokenView(row: {
   id: number; token_prefix: string; name: string | null; role: AdminRole;
   created_by: string; created_at: number; expires_at: number;
-  revoked: boolean; last_used_at: number | null;
+  revoked: boolean; last_used_at: number | null; owner_username?: string | null;
 }): AdminTokenRowView {
   return {
     id: row.id,
@@ -893,6 +987,8 @@ function toTokenView(row: {
     revoked: row.revoked,
     last_used_at: row.last_used_at,
     expired: row.expires_at <= nowSec(),
+    is_session: row.owner_username !== null && row.owner_username !== undefined,
+    owner_username: row.owner_username ?? null,
   };
 }
 

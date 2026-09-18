@@ -44,8 +44,15 @@ export interface AdminIdentity {
   /** 展示名：账户登录为用户名，令牌登录为令牌备注 */
   name: string;
   role: AdminRole;
-  /** 来源：account = 账户密码登录；static = 环境变量静态令牌；token = 动态令牌 */
+  /**
+   * 来源：
+   *   account = 账户密码登录的会话令牌（唯一能管理令牌的身份）
+   *   static  = 环境变量里的静态 ADMIN_TOKEN
+   *   token   = 后台手动签发的下级令牌
+   */
   source: "account" | "static" | "token";
+  /** 账户登录时带上用户名，便于改密码等自助操作 */
+  username?: string;
 }
 
 // ============ 密码哈希（scrypt） ============

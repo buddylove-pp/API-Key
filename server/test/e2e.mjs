@@ -81,6 +81,37 @@ function activate(body) {
   return api("/api/v1/activate", { body: { product: PRODUCT, ...body } });
 }
 
+/** 直连 /api/v1/* 的请求（api() 的前缀是 /admin/v1） */
+async function rawPost(path, body, token) {
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    /* 非 JSON */
+  }
+  return { status: res.status, json };
+}
+
+async function rawGet(path, token) {
+  const headers = {};
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(BASE + path, { headers });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    /* 非 JSON */
+  }
+  return { status: res.status, json };
+}
+
 /** 模拟 .NET 客户端离线验签 */
 function verifyTicketOffline(ticket) {
   const parts = ticket.split(".");
@@ -486,6 +517,55 @@ async function run() {
     });
     check("只读令牌无法签发令牌（403）", roMk.status === 403, `HTTP ${roMk.status}`);
 
+    // ---- 关键安全约束：令牌不能派生令牌 ----
+
+    const rootTok = await api("/admin/v1/tokens", {
+      token: session, body: { role: "root", name: "root级令牌", ttl_seconds: 1800 },
+    });
+    const rootToken = rootTok.json?.data?.token;
+    check("账户可签发 root 角色令牌", typeof rootToken === "string", JSON.stringify(rootTok.json));
+
+    const rootMk = await api("/admin/v1/tokens", {
+      token: rootToken, body: { role: "root", ttl_seconds: 1800 },
+    });
+    check("★ root 令牌无法再签发令牌（403）", rootMk.status === 403, `HTTP ${rootMk.status}`);
+
+    const staticMk = await api("/admin/v1/tokens", {
+      token: ADMIN_TOKEN, body: { role: "root", ttl_seconds: 1800 },
+    });
+    check("★ 静态 ADMIN_TOKEN 也无法签发令牌（403）", staticMk.status === 403, `HTTP ${staticMk.status}`);
+
+    const rootGen = await api("/admin/v1/licenses/generate", {
+      token: rootToken, body: { product: PRODUCT, count: 1 },
+    });
+    check("root 令牌仍可发卡（业务权限不受影响）", rootGen.json?.code === 0, JSON.stringify(rootGen.json));
+
+    const meRootTok = await rawGet("/api/v1/admin/me", rootToken);
+    check("★ root 令牌的 can_manage_tokens 为 false",
+      meRootTok.json?.data?.can_manage_tokens === false, JSON.stringify(meRootTok.json?.data));
+
+    const meSession = await rawGet("/api/v1/admin/me", session);
+    check("★ 账户会话的 can_manage_tokens 为 true",
+      meSession.json?.data?.can_manage_tokens === true, JSON.stringify(meSession.json?.data));
+    check("账户会话的 source 为 account", meSession.json?.data?.source === "account");
+    check("root 令牌的 source 为 token", meRootTok.json?.data?.source === "token");
+
+    // ---- 操作日志 ----
+
+    const audit = await api("/admin/v1/audit?page=1&page_size=100", { method: "GET", token: session });
+    check("可查操作日志", audit.json?.code === 0 && audit.json.data.total > 0, JSON.stringify(audit.json));
+    const events = (audit.json?.data?.rows ?? []).map((a) => a.event);
+    check("日志含登录成功", events.includes("admin.login.ok"), JSON.stringify(events.slice(0, 12)));
+    check("日志含登录失败", events.includes("admin.login.fail"));
+    check("日志含令牌签发", events.includes("admin.token.create"));
+    check("日志含卡密激活", events.includes("activate"));
+
+    const onlyLogin = await api("/admin/v1/audit?prefix=admin.login", { method: "GET", token: session });
+    const loginEvents = (onlyLogin.json?.data?.rows ?? []).map((a) => a.event);
+    check("按前缀筛选生效",
+      loginEvents.length > 0 && loginEvents.every((e) => e.startsWith("admin.login")),
+      JSON.stringify(loginEvents));
+
     const tooLong = await api("/admin/v1/tokens", {
       token: session, body: { role: "operator", ttl_seconds: 99999999 },
     });
@@ -618,6 +698,61 @@ async function run() {
       body: { product: PRODUCT, count: 1, check_interval_days: 99999 },
     });
     check("周期天数超上限被拒", bad3.json?.code === 4001, JSON.stringify(bad3.json));
+  }
+
+  section("18. 退出登录与改密码");
+  {
+    // 登录两次，模拟两台设备
+    const l1 = await rawPost("/api/v1/admin/login", { username: ADMIN_USER, password: ADMIN_PASS });
+    const l2 = await rawPost("/api/v1/admin/login", { username: ADMIN_USER, password: ADMIN_PASS });
+    const t1 = l1.json?.data?.token;
+    const t2 = l2.json?.data?.token;
+    check("可登录拿到两个会话", typeof t1 === "string" && typeof t2 === "string");
+
+    const u1 = await api("/admin/v1/licenses", { method: "GET", token: t1 });
+    const u2 = await api("/admin/v1/licenses", { method: "GET", token: t2 });
+    check("会话 1 可用", u1.json?.code === 0);
+    check("会话 2 可用", u2.json?.code === 0);
+
+    const lo = await rawPost("/api/v1/admin/logout", {}, t1);
+    check("退出登录成功", lo.json?.code === 0, JSON.stringify(lo.json));
+
+    const afterLo = await api("/admin/v1/licenses", { method: "GET", token: t1 });
+    check("★ 退出后该会话令牌立即失效（401）", afterLo.status === 401, `HTTP ${afterLo.status}`);
+
+    const stillOk = await api("/admin/v1/licenses", { method: "GET", token: t2 });
+    check("★ 其它会话不受影响", stillOk.json?.code === 0, JSON.stringify(stillOk.json));
+
+    const loAudit = await api("/admin/v1/audit?event=admin.logout", { method: "GET", token: t2 });
+    check("退出被记入日志", (loAudit.json?.data?.total ?? 0) >= 1, JSON.stringify(loAudit.json?.data));
+
+    // ---- 改密码 ----
+
+    const badPw = await rawPost("/api/v1/admin/password",
+      { old_password: "definitely-wrong", new_password: "new-password-123" }, t2);
+    check("原密码错误被拒 4011", badPw.json?.code === 4011, JSON.stringify(badPw.json));
+
+    const shortPw = await rawPost("/api/v1/admin/password",
+      { old_password: ADMIN_PASS, new_password: "123" }, t2);
+    check("新密码过短被拒", shortPw.json?.code === 4001, JSON.stringify(shortPw.json));
+
+    const NEW_PASS = "new-password-9876";
+    const okPw = await rawPost("/api/v1/admin/password",
+      { old_password: ADMIN_PASS, new_password: NEW_PASS }, t2);
+    check("改密码成功", okPw.json?.code === 0, JSON.stringify(okPw.json));
+    check("返回被撤销的会话数", typeof okPw.json?.data?.sessions_revoked === "number");
+
+    const keepOk = await api("/admin/v1/licenses", { method: "GET", token: t2 });
+    check("当前会话保留（没把自己踢掉）", keepOk.json?.code === 0, JSON.stringify(keepOk.json));
+
+    const oldLogin = await rawPost("/api/v1/admin/login", { username: ADMIN_USER, password: ADMIN_PASS });
+    check("旧密码无法登录", oldLogin.json?.code === 4011, JSON.stringify(oldLogin.json));
+
+    const newLogin = await rawPost("/api/v1/admin/login", { username: ADMIN_USER, password: NEW_PASS });
+    check("★ 新密码可登录", newLogin.json?.code === 0, JSON.stringify(newLogin.json));
+
+    const staticStill = await api("/admin/v1/licenses", { method: "GET", token: ADMIN_TOKEN });
+    check("静态 ADMIN_TOKEN 不受改密码影响（应急通道）", staticStill.json?.code === 0);
   }
 
   // ============ 汇总 ============

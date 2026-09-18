@@ -245,6 +245,37 @@ export function buildRouter(deps: RouterDeps): Router {
         .catch(next);
     };
 
+  /**
+   * 只允许「账户密码登录」通过。
+   *
+   * 令牌管理必须用这个，不能用 requireAuth("root") ——
+   * 否则 root 令牌可以再签发 root 令牌，等于权限能无限自我复制：
+   * 一次泄露就能不断造新令牌，撤销旧的也没用。
+   *
+   * 静态 ADMIN_TOKEN 同样被挡在外面：它是长期不变的应急凭证，
+   * 一旦泄露就成了永久提权入口。
+   */
+  const requireAccount =
+    (req: Request, res: Response, next: NextFunction): void => {
+      resolveIdentity(req)
+        .then((id) => {
+          if (!id) {
+            fail(res, ErrCode.AUTH_REQUIRED, "未登录或登录已失效，请重新登录", 401);
+            return;
+          }
+          if (id.source !== "account") {
+            fail(
+              res, ErrCode.AUTH_FORBIDDEN,
+              "签发令牌需要账户密码登录，令牌不能派生令牌", 403,
+            );
+            return;
+          }
+          (req as AuthedRequest).admin = id;
+          next();
+        })
+        .catch(next);
+    };
+
   // ============ 登录（公开，但限流） ============
 
   router.post("/api/v1/admin/login", publicLimiter, wrap(async (req, res) => {
@@ -259,6 +290,39 @@ export function buildRouter(deps: RouterDeps): Router {
     ok(res, result);
   }));
 
+  /** 退出登录：撤销当前会话令牌，避免有效凭据在服务端堆积 */
+  router.post("/api/v1/admin/logout", publicLimiter, wrap(async (req, res) => {
+    const header = req.headers.authorization ?? "";
+    const raw = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+
+    if (raw !== "") {
+      await service.logout(raw, { ip: clientIp(req), appVersion: null });
+    }
+    ok(res, { logged_out: true });
+  }));
+
+  /** 修改当前账户密码（需账户登录）。成功后踢掉该账户其它会话 */
+  router.post("/api/v1/admin/password", publicLimiter, wrap(async (req, res) => {
+    const identity = await resolveIdentity(req);
+    if (!identity || identity.source !== "account" || !identity.username) {
+      throw new ServiceError(ErrCode.AUTH_FORBIDDEN, 403);
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const oldPw = typeof body["old_password"] === "string" ? body["old_password"] : "";
+    const newPw = typeof body["new_password"] === "string" ? body["new_password"] : "";
+    if (!oldPw || !newPw) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const header = req.headers.authorization ?? "";
+    const keep = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+
+    const kicked = await service.changePassword(
+      identity.username, oldPw, newPw, keep,
+      { ip: clientIp(req), appVersion: null },
+    );
+    ok(res, { changed: true, sessions_revoked: kicked });
+  }));
+
   /** 当前身份与可选角色清单 */
   router.get("/api/v1/admin/me", wrap(async (req, res) => {
     const id = await resolveIdentity(req);
@@ -268,6 +332,9 @@ export function buildRouter(deps: RouterDeps): Router {
       ...id,
       role_label: ROLE_LABEL[id.role],
       role_desc: ROLE_DESC[id.role],
+      /** 只有账户密码登录能管理令牌 —— 令牌不能派生令牌 */
+      can_manage_tokens: id.source === "account" && id.role === "root",
+      can_change_password: id.source === "account",
       max_token_ttl_seconds: MAX_TOKEN_TTL_SECONDS,
       roles: (["readonly", "operator", "root"] as AdminRole[]).map((r) => ({
         value: r, label: ROLE_LABEL[r], desc: ROLE_DESC[r],
@@ -284,11 +351,11 @@ export function buildRouter(deps: RouterDeps): Router {
 
   // ---- 管理员令牌管理（仅 root） ----
 
-  admin.get("/tokens", requireAuth("root"), wrap(async (_req, res) => {
+  admin.get("/tokens", requireAccount, wrap(async (_req, res) => {
     ok(res, { tokens: await service.listAdminTokens() });
   }));
 
-  admin.post("/tokens", requireAuth("root"), wrap(async (req, res) => {
+  admin.post("/tokens", requireAccount, wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const identity = (req as AuthedRequest).admin!;
 
@@ -302,7 +369,7 @@ export function buildRouter(deps: RouterDeps): Router {
     ok(res, result);
   }));
 
-  admin.post("/tokens/:id/revoke", requireAuth("root"), wrap(async (req, res) => {
+  admin.post("/tokens/:id/revoke", requireAccount, wrap(async (req, res) => {
     const identity = (req as AuthedRequest).admin!;
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) throw new ServiceError(ErrCode.INVALID_PARAM);
@@ -462,6 +529,21 @@ export function buildRouter(deps: RouterDeps): Router {
 
     const result = await service.unbind(key, deviceFp, { ip: clientIp(req), appVersion: null }, true);
     ok(res, result);
+  }));
+
+  // ---- 全局审计日志（登录记录 / 令牌操作 / 卡密操作） ----
+
+  admin.get("/audit", wrap(async (req, res) => {
+    const page = Math.max(1, Number(req.query["page"] ?? 1) || 1);
+    const pageSize = Math.min(200, Math.max(1, Number(req.query["page_size"] ?? 50) || 50));
+
+    const result = await service.listAuditGlobal({
+      eventPrefix: str(req.query["prefix"]) ?? undefined,
+      event: str(req.query["event"]) ?? undefined,
+      page,
+      pageSize,
+    });
+    ok(res, { ...result, page, page_size: pageSize });
   }));
 
   router.use("/admin/v1", admin);

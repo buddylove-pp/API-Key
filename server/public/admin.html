@@ -201,6 +201,7 @@
     <span id="whoami" class="hint"></span>
     <span class="grow"></span>
     <span id="healthTag" class="tag unused">检测中…</span>
+    <button id="btnPw" class="sm" hidden>修改密码</button>
     <button id="btnLogout" class="sm">退出登录</button>
   </header>
 
@@ -210,6 +211,7 @@
       <button data-tab="list">卡密列表</button>
       <button data-tab="products">软件管理</button>
       <button data-tab="tokens" id="tabTokens">管理员令牌</button>
+      <button data-tab="audit">操作日志</button>
     </nav>
 
     <!-- ---------- 生成卡密 ---------- -->
@@ -455,7 +457,35 @@
       </div>
 
       <div class="panel">
-        <h2>已有令牌</h2>
+        <h2>登录会话</h2>
+        <div class="hint" style="margin-bottom:12px">
+          账户密码登录后自动产生的短期凭据（12 小时）。你不需要手动复制它 ——
+          浏览器已经存好了。之所以要有它，是因为 HTTP 无状态：要么每次请求都带账号密码
+          （密码反复暴露），要么登录一次换一个可撤销、可过期、可审计的令牌。这里列出是给你看
+          「谁在什么时候登录过」，怀疑异常时可以立即撤销。
+        </div>
+        <div class="row">
+          <button id="btnRefreshSessions" class="sm">刷新</button>
+        </div>
+        <div style="overflow:auto; margin-top:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>账户</th><th>前缀</th><th>角色</th>
+                <th>登录时间</th><th>到期时间</th><th>最近使用</th><th>状态</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="sessionBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>已签发的令牌</h2>
+        <div class="hint" style="margin-bottom:12px">
+          由账户手动签发、给外部程序或运维用的令牌。
+          <strong>令牌不能签发令牌</strong> —— 只有账户密码登录能签发，防止权限无限自我复制。
+        </div>
         <div class="row">
           <button id="btnRefreshTokens" class="sm">刷新</button>
         </div>
@@ -473,6 +503,58 @@
         </div>
       </div>
     </section>
+
+    <!-- ---------- 操作日志 ---------- -->
+    <section id="secAudit" hidden>
+      <div class="panel">
+        <h2>操作日志</h2>
+        <div class="hint" style="margin-bottom:12px">
+          平台的登录记录、令牌操作、卡密操作。登录失败也会记录，便于发现暴力尝试。
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>事件类型</label>
+            <select id="aFilter">
+              <option value="">全部</option>
+              <option value="admin.">管理端（登录 / 令牌 / 密码）</option>
+              <option value="admin.login">仅登录</option>
+              <option value="admin.login.fail">仅登录失败</option>
+              <option value="admin.token.">令牌操作</option>
+              <option value="activate">卡密激活</option>
+              <option value="check">定期校验</option>
+              <option value="heartbeat">心跳</option>
+              <option value="unbind">解绑</option>
+              <option value="product.">软件管理</option>
+            </select>
+          </div>
+          <button id="btnSearchAudit" class="primary">查询</button>
+          <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:4px">
+            <input id="auditAutoRefresh" type="checkbox" style="width:auto">
+            自动刷新
+          </label>
+          <span id="auditUpdated" class="hint"></span>
+        </div>
+
+        <div id="auditMsg" class="msg"></div>
+        <div style="overflow:auto; margin-top:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th><th>事件</th><th>卡密ID</th><th>设备指纹</th>
+                <th>来源 IP</th><th>客户端版本</th><th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+
+        <div class="pager">
+          <button id="btnAuditPrev" class="sm">上一页</button>
+          <span id="auditPageInfo" class="hint">—</span>
+          <button id="btnAuditNext" class="sm">下一页</button>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -484,6 +566,34 @@
     <button id="btnCloseDetail" class="sm">关闭</button>
   </div>
   <div class="dlg-body" id="detailBody"></div>
+</dialog>
+
+<!-- ==================== 修改密码 ==================== -->
+<dialog id="pwDialog">
+  <div class="dlg-head">
+    <h3>修改密码</h3>
+    <span class="grow"></span>
+    <button id="btnClosePw" class="sm">关闭</button>
+  </div>
+  <div class="dlg-body">
+    <div class="field" style="margin-bottom:12px">
+      <label>原密码</label>
+      <input id="pwOld" type="password" autocomplete="current-password" style="width:100%">
+    </div>
+    <div class="field" style="margin-bottom:12px">
+      <label>新密码（至少 8 位）</label>
+      <input id="pwNew" type="password" autocomplete="new-password" style="width:100%">
+    </div>
+    <div class="field" style="margin-bottom:16px">
+      <label>确认新密码</label>
+      <input id="pwNew2" type="password" autocomplete="new-password" style="width:100%">
+    </div>
+    <div class="hint" style="margin-bottom:14px">
+      修改成功后，该账户在其它设备上的登录会话会被撤销，需要重新登录。
+    </div>
+    <button id="btnChangePw" class="primary">确认修改</button>
+    <div id="pwMsg" class="msg"></div>
+  </div>
 </dialog>
 
 <script>
@@ -577,8 +687,10 @@
     $("roleBadge").className = "tag " + me.role;
     $("whoami").textContent = me.name + " · " + (me.role_desc || "");
 
-    // 只有 root 能看令牌管理
-    $("tabTokens").hidden = me.role !== "root";
+    // 只有「账户密码登录」能管理令牌 —— 令牌不能派生令牌。
+    // 用令牌登录时这个页签直接不显示，避免误以为可以签发。
+    $("tabTokens").hidden = !me.can_manage_tokens;
+    $("btnPw").hidden = !me.can_change_password;
   }
 
   function showLogin() {
@@ -589,12 +701,31 @@
     window.scrollTo(0, 0);
   }
 
-  function logout(silent) {
+  async function logout(silent) {
+    var t = state.token;
+
+    // 先让服务端撤销这次会话令牌。
+    // 每次登录都会新建一条最高权限凭据，退出时不撤销就会不断堆积，
+    // 留下大量仍然可用的凭据 —— 等于把风险敞口留在那里。
+    if (t && t.indexOf("adm_") === 0) {
+      try {
+        await fetch("/api/v1/admin/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + t },
+        });
+      } catch (e) {
+        // 网络不通也必须完成本地退出，不能把用户卡在"已登录"状态
+      }
+    }
+
     state.token = "";
     state.me = null;
     localStorage.removeItem("licenseAdminToken");
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (auditState.timer) { clearInterval(auditState.timer); auditState.timer = null; }
+
     showLogin();
-    if (!silent) setMsg($("loginMsg"), "已退出登录", "ok");
+    if (!silent) setMsg($("loginMsg"), "已退出登录（会话令牌已撤销）", "ok");
   }
 
   async function afterLogin(token) {
@@ -1005,6 +1136,14 @@
 
   // ---------- 管理员令牌 ----------
 
+  var ROLE_LABEL = { root: "最高权限", operator: "运营", readonly: "只读" };
+
+  function tokenState(t) {
+    if (t.revoked) return { text: "已撤销", cls: "disabled" };
+    if (t.expired) return { text: "已过期", cls: "disabled" };
+    return { text: "有效", cls: "active" };
+  }
+
   async function loadTokens() {
     var r = await api("/tokens", { method: "GET" });
     if (r.code !== 0) {
@@ -1013,34 +1152,70 @@
     }
     setMsg($("tokenListMsg"), "");
 
-    var rows = r.data.tokens || [];
-    var body = $("tokenBody");
+    var all = r.data.tokens || [];
+    renderSessions(all.filter(function (t) { return t.is_session; }));
+    renderIssued(all.filter(function (t) { return !t.is_session; }));
+  }
+
+  /** 账户登录产生的会话令牌 */
+  function renderSessions(rows) {
+    var body = $("sessionBody");
     body.innerHTML = "";
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="10" class="hint">暂无令牌</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="hint">暂无登录会话</td></tr>';
       return;
     }
 
-    var roleLabel = { root: "最高权限", operator: "运营", readonly: "只读" };
+    rows.forEach(function (t) {
+      var st = tokenState(t);
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + t.id + "</td>" +
+        "<td>" + esc(t.owner_username || t.created_by) + "</td>" +
+        '<td class="mono">' + esc(t.token_prefix) + "…</td>" +
+        '<td><span class="tag ' + t.role + '">' + ROLE_LABEL[t.role] + "</span></td>" +
+        "<td>" + fmtTime(t.created_at) + "</td>" +
+        "<td>" + fmtTime(t.expires_at) + "</td>" +
+        "<td>" + fmtTime(t.last_used_at) + "</td>" +
+        '<td><span class="tag ' + st.cls + '">' + st.text + "</span></td>";
+
+      var td = document.createElement("td");
+      if (!t.revoked && !t.expired) {
+        td.appendChild(mkBtn("撤销", function () { revokeToken(t.id, "登录会话"); }, "danger"));
+      } else {
+        td.innerHTML = '<span class="hint">—</span>';
+      }
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  /** 账户手动签发的下级令牌 */
+  function renderIssued(rows) {
+    var body = $("tokenBody");
+    body.innerHTML = "";
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="10" class="hint">暂无已签发的令牌</td></tr>';
+      return;
+    }
 
     rows.forEach(function (t) {
-      var status = t.revoked ? "已撤销" : (t.expired ? "已过期" : "有效");
-      var tagCls = t.revoked || t.expired ? "disabled" : "active";
+      var st = tokenState(t);
       var tr = document.createElement("tr");
       tr.innerHTML =
         "<td>" + t.id + "</td>" +
         '<td class="mono">' + esc(t.token_prefix) + "…</td>" +
         "<td>" + esc(t.name || "—") + "</td>" +
-        '<td><span class="tag ' + t.role + '">' + roleLabel[t.role] + "</span></td>" +
+        '<td><span class="tag ' + t.role + '">' + ROLE_LABEL[t.role] + "</span></td>" +
         "<td>" + esc(t.created_by) + "</td>" +
         "<td>" + fmtTime(t.created_at) + "</td>" +
         "<td>" + fmtTime(t.expires_at) + "</td>" +
         "<td>" + fmtTime(t.last_used_at) + "</td>" +
-        '<td><span class="tag ' + tagCls + '">' + status + "</span></td>";
+        '<td><span class="tag ' + st.cls + '">' + st.text + "</span></td>";
 
       var td = document.createElement("td");
       if (!t.revoked && !t.expired) {
-        td.appendChild(mkBtn("撤销", function () { revokeToken(t.id); }, "danger"));
+        td.appendChild(mkBtn("撤销", function () { revokeToken(t.id, "令牌"); }, "danger"));
       } else {
         td.innerHTML = '<span class="hint">—</span>';
       }
@@ -1075,11 +1250,90 @@
     loadTokens();
   }
 
-  async function revokeToken(id) {
-    if (!confirm("撤销这个令牌？使用它的调用方会立即失效。")) return;
+  async function revokeToken(id, label) {
+    if (!confirm("撤销这个" + (label || "令牌") + "？使用它的调用方会立即失效。")) return;
     var r = await api("/tokens/" + id + "/revoke", { body: {} });
     if (r.code !== 0) { alert("撤销失败：" + r.msg); return; }
     loadTokens();
+  }
+
+  // ---------- 操作日志 ----------
+
+  var auditState = { page: 1, pageSize: 50, total: 0, timer: null };
+
+  var EVENT_LABEL = {
+    "admin.login.ok": "登录成功",
+    "admin.login.fail": "登录失败",
+    "admin.logout": "退出登录",
+    "admin.password.change": "修改密码",
+    "admin.password.fail": "改密失败",
+    "admin.token.create": "签发令牌",
+    "admin.token.revoke": "撤销令牌",
+    "admin.bootstrap": "初始化账户",
+    "activate": "卡密激活",
+    "check": "定期校验",
+    "heartbeat": "心跳续期",
+    "unbind": "解绑设备",
+    "product.create": "新增软件",
+    "product.active": "启用软件",
+    "product.disabled": "停用软件",
+    "product.delete": "删除软件",
+    "generate": "生成卡密",
+    "ban": "封禁卡密",
+    "unban": "解封卡密",
+  };
+
+  function eventTone(e) {
+    if (e === "admin.login.fail" || e === "admin.password.fail") return "banned";
+    if (e.indexOf("admin.") === 0) return "pending";
+    if (e.indexOf("product.") === 0) return "operator";
+    return "unused";
+  }
+
+  async function loadAudit() {
+    var q = ["page=" + auditState.page, "page_size=" + auditState.pageSize];
+    var f = $("aFilter").value;
+    if (f) {
+      // 以 . 结尾的当作前缀匹配
+      q.push((f.endsWith(".") ? "prefix=" : "event=") + encodeURIComponent(f));
+    }
+
+    var r = await api("/audit?" + q.join("&"), { method: "GET" });
+    if (r.code !== 0) {
+      setMsg($("auditMsg"), "✗ " + r.msg, "err");
+      return;
+    }
+    setMsg($("auditMsg"), "");
+
+    auditState.total = r.data.total || 0;
+    var rows = r.data.rows || [];
+    var body = $("auditBody");
+    body.innerHTML = "";
+
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="7" class="hint">暂无记录</td></tr>';
+    }
+
+    rows.forEach(function (a) {
+      var label = EVENT_LABEL[a.event] || a.event;
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + fmtTime(a.created_at) + "</td>" +
+        '<td><span class="tag ' + eventTone(a.event) + '">' + esc(label) + "</span></td>" +
+        "<td>" + (a.license_id == null ? "—" : a.license_id) + "</td>" +
+        '<td class="mono">' + (a.device_fp ? esc(a.device_fp.slice(0, 12)) + "…" : "—") + "</td>" +
+        '<td class="mono">' + esc(a.ip || "—") + "</td>" +
+        "<td>" + esc(a.app_version || "—") + "</td>" +
+        "<td>" + esc(a.detail || "") + "</td>";
+      body.appendChild(tr);
+    });
+
+    var pages = Math.max(1, Math.ceil(auditState.total / auditState.pageSize));
+    $("auditPageInfo").textContent =
+      "第 " + auditState.page + " / " + pages + " 页，共 " + auditState.total + " 条";
+    $("btnAuditPrev").disabled = auditState.page <= 1;
+    $("btnAuditNext").disabled = auditState.page >= pages;
+    $("auditUpdated").textContent = "最后更新 " + new Date().toLocaleTimeString("zh-CN");
   }
 
   // ---------- 自动刷新 ----------
@@ -1120,7 +1374,7 @@
   // ---------- Tab 切换 ----------
 
   function switchTab(name) {
-    ["gen", "list", "products", "tokens"].forEach(function (n) {
+    ["gen", "list", "products", "tokens", "audit"].forEach(function (n) {
       var sec = $("sec" + n.charAt(0).toUpperCase() + n.slice(1));
       if (sec) sec.hidden = n !== name;
     });
@@ -1131,6 +1385,7 @@
     if (name === "list") loadList();
     if (name === "products") { loadProducts(); }
     if (name === "tokens") loadTokens();
+    if (name === "audit") { auditState.page = 1; loadAudit(); }
   }
 
   // ---------- 事件绑定 ----------
@@ -1166,7 +1421,7 @@
     }
   };
 
-  $("btnLogout").onclick = function () { logout(false); };
+  $("btnLogout").onclick = async function () { await logout(false); };
 
   // 显示/隐藏密码。不用浏览器原生那个 —— Edge/Chrome 的"眼睛"只在聚焦时出现，
   // 点空白处再回来就没了，行为不一致。自己实现一个稳定的。
@@ -1225,6 +1480,65 @@
 
   $("btnCreateToken").onclick = createToken;
   $("btnRefreshTokens").onclick = loadTokens;
+  $("btnRefreshSessions").onclick = loadTokens;
+
+  // ---------- 操作日志 ----------
+
+  $("btnSearchAudit").onclick = function () { auditState.page = 1; loadAudit(); };
+  $("aFilter").onchange = function () { auditState.page = 1; loadAudit(); };
+  $("btnAuditPrev").onclick = function () { if (auditState.page > 1) { auditState.page--; loadAudit(); } };
+  $("btnAuditNext").onclick = function () { auditState.page++; loadAudit(); };
+  $("auditAutoRefresh").onchange = function () {
+    if (auditState.timer) { clearInterval(auditState.timer); auditState.timer = null; }
+    if (!this.checked) { $("auditUpdated").textContent = ""; return; }
+    auditState.timer = setInterval(function () {
+      if ($("secAudit").hidden) return;
+      loadAudit();
+    }, 10000);
+    loadAudit();
+  };
+
+  // ---------- 修改密码 ----------
+
+  $("btnPw").onclick = function () {
+    $("pwOld").value = "";
+    $("pwNew").value = "";
+    $("pwNew2").value = "";
+    setMsg($("pwMsg"), "");
+    $("pwDialog").showModal();
+  };
+
+  $("btnClosePw").onclick = function () { $("pwDialog").close(); };
+
+  $("btnChangePw").onclick = async function () {
+    var oldPw = $("pwOld").value;
+    var n1 = $("pwNew").value;
+    var n2 = $("pwNew2").value;
+
+    if (!oldPw || !n1) { setMsg($("pwMsg"), "请填写完整", "err"); return; }
+    if (n1.length < 8) { setMsg($("pwMsg"), "新密码至少 8 位", "err"); return; }
+    if (n1 !== n2) { setMsg($("pwMsg"), "两次输入的新密码不一致", "err"); return; }
+
+    setMsg($("pwMsg"), "提交中…");
+    var res = await fetch("/api/v1/admin/password", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + state.token,
+      },
+      body: JSON.stringify({ old_password: oldPw, new_password: n1 }),
+    });
+    var j = await res.json().catch(function () { return { code: -1, msg: "响应异常" }; });
+
+    if (j.code !== 0) {
+      setMsg($("pwMsg"), "✗ " + (j.msg || "修改失败"), "err");
+      return;
+    }
+
+    setMsg($("pwMsg"),
+      "✓ 密码已修改，其它设备会话已撤销（" + ((j.data && j.data.sessions_revoked) || 0) + " 个）", "ok");
+    setTimeout(function () { $("pwDialog").close(); }, 1600);
+  };
   $("btnCopyToken").onclick = function () {
     navigator.clipboard.writeText($("newTokenValue").textContent).then(function () {
       setMsg($("tokenMsg"), "✓ 令牌已复制到剪贴板", "ok");
@@ -1261,8 +1575,10 @@
       sel.appendChild(o);
     });
     sel.value = "operator";
-    $("tokenRoleHint").textContent =
-      "只读 = 只能看；运营 = 可发卡但不能签发令牌；最高权限 = 全部。默认有效期 30 分钟。";
+    $("tokenRoleHint").innerHTML =
+      "只读 = 只能看；运营 = 可发卡但不能签发令牌；最高权限 = 全部。<br>" +
+      "<strong>只有账户密码登录能签发令牌</strong> —— 令牌不能派生令牌，" +
+      "防止一次泄露后权限被无限复制。默认有效期 30 分钟。";
 
     var saved = localStorage.getItem("licenseAdminToken");
     if (saved) {
