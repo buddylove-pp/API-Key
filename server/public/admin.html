@@ -95,7 +95,11 @@
   .tabs{display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap}
   .tabs button{border-radius:6px}
   .tabs button.on{background:var(--accent); color:#fff; border-color:var(--accent)}
-  section[hidden],div[hidden]{display:none}
+  /* hidden 是语义属性：表示"这个元素不渲染"，必须压过任何 display 样式。
+     否则 #loginScreen{display:flex} 这类 ID 选择器会盖掉它
+     （ID 特异性 1-0-0 > 元素+属性 0-1-1），导致登录屏隐藏不掉、
+     主界面只是接在下面 —— 看起来就像"登录后往下滚动"。 */
+  [hidden]{display:none !important}
   .tokenbox{
     background:#f0f7ff; border:1px solid #b8d4f5; border-radius:6px;
     padding:12px; margin-top:12px;
@@ -566,6 +570,7 @@
   function showApp() {
     $("loginScreen").hidden = true;
     $("app").hidden = false;
+    window.scrollTo(0, 0);
 
     var me = state.me;
     $("roleBadge").textContent = me.role_label || me.role;
@@ -581,6 +586,7 @@
     $("app").hidden = true;
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
     resetPasswordFields();
+    window.scrollTo(0, 0);
   }
 
   function logout(silent) {
