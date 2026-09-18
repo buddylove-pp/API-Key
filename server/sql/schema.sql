@@ -1,6 +1,59 @@
 -- 卡密授权系统 · PostgreSQL Schema
 -- 首次部署时由服务自动执行（AUTO_MIGRATE=true），也可手动 psql 执行
 
+-- ============ 软件注册表 ============
+-- 卡密的 product 维度必须来自这里，避免手输错字导致卡密和软件对不上。
+-- 注册方式：客户端首次调用 /api/v1/activate 上报未知标识时自动登记为 pending，
+-- 管理员在后台确认后置为 active，之后才能为该软件生成卡密。
+CREATE TABLE IF NOT EXISTS products (
+  id            BIGSERIAL PRIMARY KEY,
+  code          TEXT      NOT NULL UNIQUE,  -- 软件标识，客户端上报的值
+  name          TEXT      NOT NULL,         -- 展示名，后台下拉框显示
+  status        TEXT      NOT NULL DEFAULT 'active',  -- active | pending | disabled
+  note          TEXT,
+  created_at    BIGINT    NOT NULL,
+  first_seen_at BIGINT,                     -- 首次被客户端上报的时间
+  first_seen_ip TEXT,
+  app_version   TEXT                        -- 首次上报时的客户端版本
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_status ON products (status);
+
+-- 预置内置测试客户端
+INSERT INTO products (code, name, status, note, created_at)
+VALUES ('license-tester', '卡密授权测试客户端', 'active', '仓库内置的测试工具', EXTRACT(EPOCH FROM NOW())::BIGINT)
+ON CONFLICT (code) DO NOTHING;
+
+-- ============ 管理员账户 ============
+-- 账户密码登录 → 最高权限，可在界面里签发下级令牌
+CREATE TABLE IF NOT EXISTS admin_users (
+  id            BIGSERIAL PRIMARY KEY,
+  username      TEXT      NOT NULL UNIQUE,
+  password_hash TEXT      NOT NULL,   -- scrypt 格式：scrypt$N$r$p$salt$hash
+  role          TEXT      NOT NULL DEFAULT 'root',   -- root | operator | readonly
+  disabled      BOOLEAN   NOT NULL DEFAULT FALSE,
+  created_at    BIGINT    NOT NULL,
+  last_login_at BIGINT
+);
+
+-- ============ 管理员令牌 ============
+-- 由账户签发，带权限角色与有效期。只存哈希，明文只在签发时返回一次。
+CREATE TABLE IF NOT EXISTS admin_tokens (
+  id           BIGSERIAL PRIMARY KEY,
+  token_hash   TEXT      NOT NULL UNIQUE,  -- SHA-256(令牌)，不存明文
+  token_prefix TEXT      NOT NULL,         -- 前 12 位，便于在列表里辨认
+  name         TEXT,                       -- 备注，例如「给运维用」
+  role         TEXT      NOT NULL,         -- 该令牌的权限角色
+  created_by   TEXT      NOT NULL,         -- 签发者用户名
+  created_at   BIGINT    NOT NULL,
+  expires_at   BIGINT    NOT NULL,
+  revoked      BOOLEAN   NOT NULL DEFAULT FALSE,
+  last_used_at BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_tokens_hash ON admin_tokens (token_hash);
+CREATE INDEX IF NOT EXISTS idx_admin_tokens_expires ON admin_tokens (expires_at);
+
 -- ============ 卡密表 ============
 -- 授权策略全部可配置，不写死在代码里
 CREATE TABLE IF NOT EXISTS licenses (

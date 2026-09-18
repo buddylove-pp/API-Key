@@ -7,12 +7,26 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
-import { keyFingerprint, publicKeyToPem, isValidDeviceFp, type TicketPayload } from "./crypto.js";
+import { keyFingerprint, publicKeyToPem, isValidDeviceFp } from "./crypto.js";
 import type { KeyObject } from "node:crypto";
+import {
+  MAX_TOKEN_TTL_SECONDS,
+  ROLE_DESC,
+  ROLE_LABEL,
+  isAdminRole,
+  roleAtLeast,
+  type AdminIdentity,
+  type AdminRole,
+} from "./adminauth.js";
 import { ErrCode, ServiceError, type CallContext, type LicenseService } from "./service.js";
 import { RateLimiter } from "./ratelimit.js";
 
 const MAX_BODY = "16kb";
+
+/** 带身份信息的请求 */
+interface AuthedRequest extends Request {
+  admin?: AdminIdentity;
+}
 
 function ok(res: Response, data: unknown): void {
   res.json({ code: 0, msg: "ok", data });
@@ -41,23 +55,6 @@ function str(v: unknown): string | null {
 
 function ctxOf(req: Request, body: Record<string, unknown>): CallContext {
   return { ip: clientIp(req), appVersion: str(body["app_version"]) };
-}
-
-/** 管理接口鉴权：定长比较，避免时序侧信道 */
-function adminAuth(expected: string) {
-  const expectedBuf = Buffer.from(expected, "utf8");
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    const givenBuf = Buffer.from(token, "utf8");
-
-    const same = givenBuf.length === expectedBuf.length && timingSafeEqual(givenBuf, expectedBuf);
-    if (!same) {
-      fail(res, 4010, "管理令牌无效", 401);
-      return;
-    }
-    next();
-  };
 }
 
 export interface RouterDeps {
@@ -176,11 +173,167 @@ export function buildRouter(deps: RouterDeps): Router {
 
   // ============ 管理端 ============
 
+  // ---------- 身份解析与角色守卫 ----------
+
+  const staticTokenBuf = Buffer.from(adminToken, "utf8");
+
+  /**
+   * 两种令牌都走 `Authorization: Bearer`，靠前缀和查库区分：
+   *   1) 环境变量静态令牌 —— 不落库、永不过期，始终 root（兼容既有接入）
+   *   2) 动态令牌 —— 账户登录签发的会话，或后台签发的下级令牌
+   */
+  async function resolveIdentity(req: Request): Promise<AdminIdentity | null> {
+    const header = req.headers.authorization ?? "";
+    if (!header.startsWith("Bearer ")) return null;
+
+    const raw = header.slice(7).trim();
+    if (raw === "") return null;
+
+    const givenBuf = Buffer.from(raw, "utf8");
+    if (givenBuf.length === staticTokenBuf.length && timingSafeEqual(givenBuf, staticTokenBuf)) {
+      return { name: "静态管理令牌", role: "root", source: "static" };
+    }
+    return service.resolveToken(raw);
+  }
+
+  const requireAuth = (minRole: AdminRole) =>
+    (req: Request, res: Response, next: NextFunction): void => {
+      resolveIdentity(req)
+        .then((id) => {
+          if (!id) {
+            fail(res, ErrCode.AUTH_REQUIRED, "未登录或登录已失效，请重新登录", 401);
+            return;
+          }
+          if (!roleAtLeast(id.role, minRole)) {
+            fail(res, ErrCode.AUTH_FORBIDDEN, "当前身份无权执行此操作", 403);
+            return;
+          }
+          (req as AuthedRequest).admin = id;
+          next();
+        })
+        .catch(next);
+    };
+
+  // ============ 登录（公开，但限流） ============
+
+  router.post("/api/v1/admin/login", publicLimiter, wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const username = str(body["username"]);
+    const password = typeof body["password"] === "string" ? body["password"] : "";
+    if (!username || !password) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const result = await service.login(username, password, {
+      ip: clientIp(req), appVersion: null,
+    });
+    ok(res, result);
+  }));
+
+  /** 当前身份与可选角色清单 */
+  router.get("/api/v1/admin/me", wrap(async (req, res) => {
+    const id = await resolveIdentity(req);
+    if (!id) throw new ServiceError(ErrCode.AUTH_REQUIRED, 401);
+
+    ok(res, {
+      ...id,
+      role_label: ROLE_LABEL[id.role],
+      role_desc: ROLE_DESC[id.role],
+      max_token_ttl_seconds: MAX_TOKEN_TTL_SECONDS,
+      roles: (["readonly", "operator", "root"] as AdminRole[]).map((r) => ({
+        value: r, label: ROLE_LABEL[r], desc: ROLE_DESC[r],
+      })),
+    });
+  }));
+
+  // ============ 管理接口 ============
+
   const admin = Router();
-  admin.use(adminAuth(adminToken));
+  // 先限流再鉴权：否则令牌可以被无限次暴力尝试
+  admin.use(publicLimiter);
+  admin.use(requireAuth("readonly"));
+
+  // ---- 管理员令牌管理（仅 root） ----
+
+  admin.get("/tokens", requireAuth("root"), wrap(async (_req, res) => {
+    ok(res, { tokens: await service.listAdminTokens() });
+  }));
+
+  admin.post("/tokens", requireAuth("root"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const identity = (req as AuthedRequest).admin!;
+
+    const role = body["role"];
+    if (!isAdminRole(role)) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const ttl = Number(body["ttl_seconds"] ?? 1800);
+    const result = await service.createAdminToken(
+      role, str(body["name"]), ttl, identity.name,
+    );
+    ok(res, result);
+  }));
+
+  admin.post("/tokens/:id/revoke", requireAuth("root"), wrap(async (req, res) => {
+    const identity = (req as AuthedRequest).admin!;
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    await service.revokeAdminToken(id, identity.name);
+    ok(res, { id, revoked: true });
+  }));
+
+  // ============ 软件注册表 ============
+  // 卡密的 product 维度只能从这里来，杜绝手输错字
+
+  /** 软件列表 */
+  admin.get("/products", wrap(async (req, res) => {
+    const s = str(req.query["status"]);
+    const status = s === "active" || s === "pending" || s === "disabled" ? s : undefined;
+    const products = await service.listProducts(status);
+    ok(res, {
+      products,
+      total: products.length,
+      pending: products.filter((p) => p.status === "pending").length,
+    });
+  }));
+
+  /** 手动新增软件 */
+  admin.post("/products", requireAuth("operator"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const code = str(body["code"]);
+    if (!code) throw new ServiceError(ErrCode.INVALID_PARAM);
+    const row = await service.createProduct(code, str(body["name"]) ?? code, str(body["note"]));
+    ok(res, row);
+  }));
+
+  /** 改名 / 改备注 */
+  admin.patch("/products/:code", requireAuth("operator"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: { name?: string; note?: string | null } = {};
+    const name = str(body["name"]);
+    if (name) patch.name = name;
+    if ("note" in body) patch.note = str(body["note"]);
+    await service.updateProductInfo(String(req.params.code), patch);
+    ok(res, { code: req.params.code, updated: true });
+  }));
+
+  /** 启用 / 停用 / 确认待审 */
+  admin.post("/products/:code/status", requireAuth("operator"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const s = str(body["status"]);
+    if (s !== "active" && s !== "pending" && s !== "disabled") {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    await service.setProductStatus(String(req.params.code), s);
+    ok(res, { code: req.params.code, status: s });
+  }));
+
+  /** 删除（已有卡密的软件不允许删） */
+  admin.delete("/products/:code", requireAuth("operator"), wrap(async (req, res) => {
+    await service.deleteProduct(String(req.params.code));
+    ok(res, { code: req.params.code, deleted: true });
+  }));
 
   /** 批量生成卡密 */
-  admin.post("/licenses/generate", wrap(async (req, res) => {
+  admin.post("/licenses/generate", requireAuth("operator"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const count = Number(body["count"] ?? 1);
     if (!Number.isInteger(count) || count < 1 || count > 1000) {
@@ -245,7 +398,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 封禁 */
-  admin.post("/licenses/ban", wrap(async (req, res) => {
+  admin.post("/licenses/ban", requireAuth("operator"), wrap(async (req, res) => {
     const key = str(((req.body ?? {}) as Record<string, unknown>)["license_key"]);
     if (!key) throw new ServiceError(ErrCode.INVALID_PARAM);
     const lic = await service.findByKey(key);
@@ -255,7 +408,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 解封 */
-  admin.post("/licenses/unban", wrap(async (req, res) => {
+  admin.post("/licenses/unban", requireAuth("operator"), wrap(async (req, res) => {
     const key = str(((req.body ?? {}) as Record<string, unknown>)["license_key"]);
     if (!key) throw new ServiceError(ErrCode.INVALID_PARAM);
     const lic = await service.findByKey(key);
@@ -266,7 +419,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 管理员强制解绑（不受解绑次数限制，也不扣次数） */
-  admin.post("/licenses/unbind", wrap(async (req, res) => {
+  admin.post("/licenses/unbind", requireAuth("operator"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const key = str(body["license_key"]);
     const deviceFp = str(body["device_fp"]);

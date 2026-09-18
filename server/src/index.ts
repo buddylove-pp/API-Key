@@ -6,6 +6,7 @@
  */
 
 import express, { type NextFunction, type Request, type Response } from "express";
+import { timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, validateConfig } from "./config.js";
@@ -37,6 +38,20 @@ async function main(): Promise<void> {
 
   const service = new LicenseService(repo, privateKey, publicKey);
 
+  // 首次启动时种下 root 账户（已有账户则跳过，不会覆盖密码）
+  if (config.adminUsername !== "" && config.adminPassword !== "") {
+    try {
+      const created = await service.ensureRootUser(config.adminUsername, config.adminPassword);
+      if (created) {
+        console.log(`[auth] 已创建 root 账户「${config.adminUsername}」`);
+      }
+    } catch (e) {
+      console.error("[auth] 创建 root 账户失败:", e instanceof Error ? e.message : e);
+    }
+  } else if (config.dbDriver === "pg") {
+    console.warn("[auth] 未设置 ADMIN_USERNAME / ADMIN_PASSWORD，跳过 root 账户初始化");
+  }
+
   const app = express();
   app.disable("x-powered-by");
   // orkestr 在容器前面有反向代理，需要信任 X-Forwarded-For 才能拿到真实 IP
@@ -55,6 +70,26 @@ async function main(): Promise<void> {
   // 管理后台页面：静态 HTML，由本服务直接托管
   const here = dirname(fileURLToPath(import.meta.url));
   const publicDir = join(here, "..", "public");
+
+  // HTTP Basic Auth 登录门（可选）。设在 /admin 之前，
+  // 这样页面本身和管理接口 /admin/v1/* 都受保护 —— 未登录连界面都看不到。
+  if (config.adminBasicAuth !== "") {
+    const expected = Buffer.from(config.adminBasicAuth, "utf8");
+    app.use("/admin", (req: Request, res: Response, next: NextFunction) => {
+      const header = req.headers.authorization ?? "";
+      if (header.startsWith("Basic ")) {
+        const given = Buffer.from(header.slice(6), "base64").toString("utf8");
+        const givenBuf = Buffer.from(given, "utf8");
+        if (givenBuf.length === expected.length && timingSafeEqual(givenBuf, expected)) {
+          next();
+          return;
+        }
+      }
+      res.setHeader("WWW-Authenticate", 'Basic realm="License Admin", charset="UTF-8"');
+      res.status(401).send("需要登录");
+    });
+  }
+
   app.get("/admin", (_req: Request, res: Response) => {
     res.sendFile(join(publicDir, "admin.html"));
   });

@@ -75,6 +75,9 @@ if [ "${SKIP_ENV:-0}" != "1" ]; then
         RATE_LIMIT_MAX: env.RATE_LIMIT_MAX || "60",
         RATE_LIMIT_WINDOW_SEC: env.RATE_LIMIT_WINDOW_SEC || "60",
       };
+      // 首次部署用：创建 root 账户（账户表非空时平台侧会忽略，不会覆盖密码）
+      if (env.ADMIN_USERNAME) vars.ADMIN_USERNAME = env.ADMIN_USERNAME;
+      if (env.ADMIN_PASSWORD) vars.ADMIN_PASSWORD = env.ADMIN_PASSWORD;
       process.stdout.write(JSON.stringify({ env_vars: vars }));
     ' | auth_curl -X PATCH -d @- "$BASE/projects/$ORKESTR_PROJECT_ID/environments/$ENV_ID"
   )"

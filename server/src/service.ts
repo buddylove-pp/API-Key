@@ -16,7 +16,22 @@ import {
   TICKET_VERSION,
   type TicketPayload,
 } from "./crypto.js";
-import type { BindingRow, LicenseRow, Repo } from "./repo.js";
+import type { BindingRow, LicenseRow, ProductRow, ProductStatus, Repo } from "./repo.js";
+import {
+  DEFAULT_TOKEN_TTL_SECONDS,
+  MAX_TOKEN_TTL_SECONDS,
+  generateAdminToken,
+  hashAdminToken,
+  hashPassword,
+  isAdminRole,
+  tokenPrefixOf,
+  verifyPassword,
+  type AdminIdentity,
+  type AdminRole,
+} from "./adminauth.js";
+
+/** 账户登录后签发的会话令牌有效期：12 小时 */
+export const LOGIN_SESSION_TTL_SECONDS = 12 * 60 * 60;
 
 export const nowSec = (): number => Math.floor(Date.now() / 1000);
 
@@ -35,11 +50,16 @@ export const ErrCode = {
   LICENSE_EXPIRED: 1004,
   DEVICE_LIMIT_REACHED: 1005,
   PRODUCT_MISMATCH: 1006,
+  PRODUCT_NOT_REGISTERED: 1007,
 
   TICKET_INVALID: 2001,
 
   NOT_BOUND: 3001,
   UNBIND_EXHAUSTED: 3002,
+
+  AUTH_REQUIRED: 4010,
+  AUTH_FAILED: 4011,
+  AUTH_FORBIDDEN: 4012,
 } as const;
 
 const ERR_MESSAGE: Record<number, string> = {
@@ -50,9 +70,13 @@ const ERR_MESSAGE: Record<number, string> = {
   [ErrCode.LICENSE_EXPIRED]: "卡密已过期",
   [ErrCode.DEVICE_LIMIT_REACHED]: "绑定设备数已达上限，请先解绑其他设备",
   [ErrCode.PRODUCT_MISMATCH]: "该卡密不适用于本软件",
+  [ErrCode.PRODUCT_NOT_REGISTERED]: "该软件尚未在后台启用，请联系管理员确认",
   [ErrCode.TICKET_INVALID]: "授权已失效，请重新激活",
   [ErrCode.NOT_BOUND]: "该设备未绑定到此卡密",
   [ErrCode.UNBIND_EXHAUSTED]: "解绑次数已用尽，请联系客服",
+  [ErrCode.AUTH_REQUIRED]: "未登录或登录已失效，请重新登录",
+  [ErrCode.AUTH_FAILED]: "账号或密码错误",
+  [ErrCode.AUTH_FORBIDDEN]: "当前身份无权执行此操作",
 };
 
 export class ServiceError extends Error {
@@ -159,6 +183,18 @@ export class LicenseService {
 
     const lic = await this.repo.findLicenseByKeyHash(sha256Hex(normalized));
     if (!lic) throw new ServiceError(ErrCode.LICENSE_NOT_FOUND);
+
+    // 软件注册校验：标识必须已在后台启用。
+    // 未登记过的先登记为 pending，管理员在后台确认后即可发卡。
+    // ⚠️ 顺序很关键：放在卡密校验之后，否则无效卡密能把注册表刷爆。
+    const prod = await this.repo.findProductByCode(product);
+    if (!prod) {
+      await this.repo.registerUnknownProduct(product, now, ctx.ip, ctx.appVersion);
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
+    if (prod.status !== "active") {
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
 
     // 软件维度校验：A 软件的卡密不能在 B 软件上激活
     if (lic.product !== product) throw new ServiceError(ErrCode.PRODUCT_MISMATCH);
@@ -312,6 +348,12 @@ export class LicenseService {
   async generate(count: number, opts: GenerateOptions): Promise<string[]> {
     if (count < 1 || count > 1000) throw new ServiceError(ErrCode.INVALID_PARAM);
 
+    // 只能为「已启用」的软件发卡，避免标识打错字造出对不上的卡密
+    const prod = await this.repo.findProductByCode(opts.product);
+    if (!prod || prod.status !== "active") {
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
+
     const now = nowSec();
     const expiresAt = opts.expires_in_days === null
       ? null
@@ -387,4 +429,229 @@ export class LicenseService {
   async auditOf(lic: LicenseRow, limit: number) {
     return this.repo.listAudit(lic.id, limit);
   }
+
+  // ---------- 软件注册表 ----------
+
+  async listProducts(status?: ProductStatus): Promise<ProductRow[]> {
+    return this.repo.listProducts(status);
+  }
+
+  async createProduct(code: string, name: string, note: string | null): Promise<ProductRow> {
+    const trimmed = code.trim();
+    // 客户端上报的标识必须是安全字符集，避免注入到日志或 SQL 里出问题
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$/.test(trimmed)) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (await this.repo.findProductByCode(trimmed)) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+
+    const now = nowSec();
+    const row = await this.repo.createProduct({
+      code: trimmed,
+      name: name.trim() || trimmed,
+      status: "active",
+      note,
+      created_at: now,
+    });
+    await this.repo.audit({
+      license_id: null, event: "product.create", detail: trimmed, created_at: now,
+    });
+    return row;
+  }
+
+  async setProductStatus(code: string, status: ProductStatus): Promise<void> {
+    if (!(await this.repo.findProductByCode(code))) {
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
+    await this.repo.setProductStatus(code, status);
+    await this.repo.audit({
+      license_id: null, event: `product.${status}`, detail: code, created_at: nowSec(),
+    });
+  }
+
+  async updateProductInfo(
+    code: string, patch: { name?: string; note?: string | null },
+  ): Promise<void> {
+    if (!(await this.repo.findProductByCode(code))) {
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
+    await this.repo.updateProductInfo(code, patch);
+  }
+
+  async deleteProduct(code: string): Promise<void> {
+    if (!(await this.repo.findProductByCode(code))) {
+      throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
+    }
+    // 已有卡密的软件不允许删除，避免留下孤儿卡密
+    const { total } = await this.repo.listLicenses({ product: code, page: 1, pageSize: 1 });
+    if (total > 0) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    await this.repo.deleteProduct(code);
+    await this.repo.audit({
+      license_id: null, event: "product.delete", detail: code, created_at: nowSec(),
+    });
+  }
+
+  // ---------- 管理员账户与令牌 ----------
+
+  /**
+   * 首次启动时种下 root 账户。已有账户则什么都不做 ——
+   * 所以改密码要走后台，改环境变量不会覆盖已有账户。
+   */
+  async ensureRootUser(username: string, password: string): Promise<boolean> {
+    if ((await this.repo.countAdminUsers()) > 0) return false;
+
+    const now = nowSec();
+    await this.repo.createAdminUser({
+      username,
+      password_hash: hashPassword(password),
+      role: "root",
+      created_at: now,
+    });
+    await this.repo.audit({
+      license_id: null, event: "admin.bootstrap", detail: `首次创建 root 账户 ${username}`,
+      created_at: now,
+    });
+    return true;
+  }
+
+  /** 账户密码登录 → 签发会话令牌 */
+  async login(
+    username: string, password: string, ctx: CallContext,
+  ): Promise<{ token: string; expires_at: number; role: AdminRole; username: string }> {
+    const now = nowSec();
+    const user = await this.repo.findAdminUser(username);
+
+    // 用户名不存在也走一次哈希校验，避免通过响应时间探测用户是否存在
+    const ok = verifyPassword(password, user?.password_hash ?? "scrypt$0$0$0$AAAA$AAAA");
+
+    if (!user || !ok || user.disabled) {
+      await this.repo.audit({
+        license_id: null, event: "admin.login.fail",
+        detail: `user=${username}`, ip: ctx.ip, created_at: now,
+      });
+      throw new ServiceError(ErrCode.AUTH_FAILED, 401);
+    }
+
+    const raw = generateAdminToken();
+    const expiresAt = now + LOGIN_SESSION_TTL_SECONDS;
+
+    await this.repo.createAdminToken({
+      token_hash: hashAdminToken(raw),
+      token_prefix: tokenPrefixOf(raw),
+      name: `登录会话 · ${username}`,
+      role: user.role,
+      created_by: username,
+      created_at: now,
+      expires_at: expiresAt,
+    });
+    await this.repo.touchAdminUserLogin(user.id, now);
+    await this.repo.audit({
+      license_id: null, event: "admin.login.ok",
+      detail: `user=${username}`, ip: ctx.ip, created_at: now,
+    });
+
+    return { token: raw, expires_at: expiresAt, role: user.role, username };
+  }
+
+  /**
+   * 校验动态令牌。
+   * 静态 ADMIN_TOKEN 的校验在路由层完成（它不落库、永不过期）。
+   */
+  async resolveToken(raw: string): Promise<AdminIdentity | null> {
+    if (!raw.startsWith("adm_")) return null;
+
+    const row = await this.repo.findAdminTokenByHash(hashAdminToken(raw));
+    if (!row || row.revoked) return null;
+
+    const now = nowSec();
+    if (row.expires_at <= now) return null;
+
+    // 顺手记录最近使用时间，便于后台看出哪些令牌还在被用
+    await this.repo.touchAdminToken(row.id, now);
+
+    return { name: row.name ?? row.token_prefix, role: row.role, source: "token" };
+  }
+
+  /** 签发下级令牌（需 root） */
+  async createAdminToken(
+    role: AdminRole, name: string | null, ttlSeconds: number, createdBy: string,
+  ): Promise<{ token: string; row: AdminTokenRowView }> {
+    if (!isAdminRole(role)) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const ttl = Math.floor(ttlSeconds);
+    if (!Number.isFinite(ttl) || ttl < 60 || ttl > MAX_TOKEN_TTL_SECONDS) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+
+    const now = nowSec();
+    const raw = generateAdminToken();
+    const row = await this.repo.createAdminToken({
+      token_hash: hashAdminToken(raw),
+      token_prefix: tokenPrefixOf(raw),
+      name: name?.trim() || null,
+      role,
+      created_by: createdBy,
+      created_at: now,
+      expires_at: now + ttl,
+    });
+
+    await this.repo.audit({
+      license_id: null, event: "admin.token.create",
+      detail: `role=${role} ttl=${ttl}s by=${createdBy}`, created_at: now,
+    });
+
+    return { token: raw, row: toTokenView(row) };
+  }
+
+  async listAdminTokens(): Promise<AdminTokenRowView[]> {
+    const rows = await this.repo.listAdminTokens();
+    return rows.map(toTokenView);
+  }
+
+  async revokeAdminToken(id: number, by: string): Promise<void> {
+    const ok = await this.repo.revokeAdminToken(id);
+    if (!ok) throw new ServiceError(ErrCode.INVALID_PARAM);
+    await this.repo.audit({
+      license_id: null, event: "admin.token.revoke", detail: `id=${id} by=${by}`,
+      created_at: nowSec(),
+    });
+  }
 }
+
+/** 对外返回的令牌视图：不含哈希 */
+export interface AdminTokenRowView {
+  id: number;
+  token_prefix: string;
+  name: string | null;
+  role: AdminRole;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  revoked: boolean;
+  last_used_at: number | null;
+  /** 是否已过期 */
+  expired: boolean;
+}
+
+function toTokenView(row: {
+  id: number; token_prefix: string; name: string | null; role: AdminRole;
+  created_by: string; created_at: number; expires_at: number;
+  revoked: boolean; last_used_at: number | null;
+}): AdminTokenRowView {
+  return {
+    id: row.id,
+    token_prefix: row.token_prefix,
+    name: row.name,
+    role: row.role,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    revoked: row.revoked,
+    last_used_at: row.last_used_at,
+    expired: row.expires_at <= nowSec(),
+  };
+}
+
+export { DEFAULT_TOKEN_TTL_SECONDS };

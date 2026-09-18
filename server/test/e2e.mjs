@@ -26,6 +26,8 @@ const root = join(here, "..");
 const PORT = 18080;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ADMIN_TOKEN = "test_admin_token_0123456789abcdefghijklmn";
+const ADMIN_USER = "XIaoLKey";
+const ADMIN_PASS = "test-password-55588800";
 
 /** 本测试客户端对应的软件标识 */
 const PRODUCT = "license-tester";
@@ -108,6 +110,8 @@ const child = spawn(process.execPath, [join(root, "dist", "index.js")], {
     PORT: String(PORT),
     DB_DRIVER: "memory",
     ADMIN_TOKEN,
+    ADMIN_USERNAME: ADMIN_USER,
+    ADMIN_PASSWORD: ADMIN_PASS,
     TICKET_PRIVATE_KEY_PEM: privateKey.replace(/\n/g, "\\n"),
     AUTO_MIGRATE: "true",
     RATE_LIMIT_MAX: "100000",
@@ -213,12 +217,25 @@ async function run() {
     check("卡密格式为 5 组 × 5 字符", /^[0-9A-Z]{5}(-[0-9A-Z]{5}){4}$/.test(key1 ?? ""), key1);
     check("两张卡密不重复", key1 !== key2);
 
+    // 软件必须先注册才能发卡（防止标识打错字造出对不上的卡密）
+    const cp = await api("/admin/v1/products", {
+      token: ADMIN_TOKEN,
+      body: { code: OTHER_PRODUCT, name: "另一个软件" },
+    });
+    check("可注册新软件", cp.json?.code === 0, JSON.stringify(cp.json));
+
     const g2 = await api("/admin/v1/licenses/generate", {
       token: ADMIN_TOKEN,
       body: { product: OTHER_PRODUCT, count: 1, activation_days: 30 },
     });
     otherKey = g2.json?.data?.keys?.[0];
     check("可为另一个软件单独生成卡密", typeof otherKey === "string");
+
+    const badProd = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: "never-registered-app", count: 1 },
+    });
+    check("未注册的软件无法发卡（1007）", badProd.json?.code === 1007, JSON.stringify(badProd.json));
 
     const byProduct = await api(`/admin/v1/licenses?product=${PRODUCT}`, {
       method: "GET",
@@ -272,6 +289,30 @@ async function run() {
       body: { license_key: otherKey, device_fp: FP_A, product: OTHER_PRODUCT },
     });
     check("另一软件的客户端可用其专属卡密激活", ownKey.json?.code === 0, JSON.stringify(ownKey.json));
+
+    // 客户端首次上报未知软件标识 → 自动登记为 pending，管理员在后台一键确认
+    const unknown = await api("/api/v1/activate", {
+      body: { license_key: key1, device_fp: FP_B, product: "brand-new-app" },
+    });
+    check("未注册软件激活被拒（1007）", unknown.json?.code === 1007, JSON.stringify(unknown.json));
+
+    const pending = await api("/admin/v1/products?status=pending", {
+      method: "GET", token: ADMIN_TOKEN,
+    });
+    const codes = (pending.json?.data?.products ?? []).map((p) => p.code);
+    check("未注册软件被自动登记为待确认", codes.includes("brand-new-app"), JSON.stringify(codes));
+
+    const approve = await api("/admin/v1/products/brand-new-app/status", {
+      token: ADMIN_TOKEN, body: { status: "active" },
+    });
+    check("可一键确认待审软件", approve.json?.code === 0, JSON.stringify(approve.json));
+
+    // 确认后同一个标识就能正常走后续校验（此处卡密不属于该软件，应为 1006 而非 1007）
+    const afterApprove = await api("/api/v1/activate", {
+      body: { license_key: key1, device_fp: FP_B, product: "brand-new-app" },
+    });
+    check("确认后不再报未注册（转为卡密不匹配 1006）", afterApprove.json?.code === 1006,
+      JSON.stringify(afterApprove.json));
   }
 
   section("6. 幂等与设备上限");
@@ -394,6 +435,73 @@ async function run() {
     const list = await api("/admin/v1/licenses?page=1&page_size=10", { method: "GET", token: ADMIN_TOKEN });
     check("卡密列表可查", list.status === 200 && Array.isArray(list.json?.data?.rows));
     check("列表返回总数", typeof list.json?.data?.total === "number");
+  }
+
+  section("13. 管理员账户与令牌");
+  {
+    const anon = await api("/admin/v1/licenses", { method: "GET" });
+    check("未登录访问管理接口被拒 401", anon.status === 401, `HTTP ${anon.status}`);
+
+    const badLogin = await api("/api/v1/admin/login", {
+      body: { username: ADMIN_USER, password: "definitely-wrong" },
+    });
+    check("密码错误被拒 4011", badLogin.json?.code === 4011, JSON.stringify(badLogin.json));
+
+    const login = await api("/api/v1/admin/login", {
+      body: { username: ADMIN_USER, password: ADMIN_PASS },
+    });
+    check("账户密码登录成功", login.json?.code === 0, JSON.stringify(login.json));
+    const session = login.json?.data?.token;
+    check("登录返回会话令牌", typeof session === "string" && session.startsWith("adm_"));
+    check("root 账户角色为 root", login.json?.data?.role === "root");
+
+    const me = await api("/api/v1/admin/me", { method: "GET", token: session });
+    check("会话令牌可查当前身份", me.json?.data?.role === "root", JSON.stringify(me.json));
+
+    const mk = await api("/admin/v1/tokens", {
+      token: session,
+      body: { role: "readonly", name: "只读测试", ttl_seconds: 1800 },
+    });
+    check("可签发下级令牌", mk.json?.code === 0, JSON.stringify(mk.json));
+    const roToken = mk.json?.data?.token;
+    check("签发返回明文令牌（仅此一次）", typeof roToken === "string" && roToken.startsWith("adm_"));
+
+    const roList = await api("/admin/v1/licenses", { method: "GET", token: roToken });
+    check("只读令牌可查列表", roList.json?.code === 0, JSON.stringify(roList.json));
+
+    const roGen = await api("/admin/v1/licenses/generate", {
+      token: roToken, body: { product: PRODUCT, count: 1 },
+    });
+    check("只读令牌无法生成卡密（403）", roGen.status === 403, `HTTP ${roGen.status}`);
+
+    const roMk = await api("/admin/v1/tokens", {
+      token: roToken, body: { role: "root", ttl_seconds: 1800 },
+    });
+    check("只读令牌无法签发令牌（403）", roMk.status === 403, `HTTP ${roMk.status}`);
+
+    const tooLong = await api("/admin/v1/tokens", {
+      token: session, body: { role: "operator", ttl_seconds: 99999999 },
+    });
+    check("超出上限的有效期被拒", tooLong.json?.code === 4001, JSON.stringify(tooLong.json));
+
+    const tooShort = await api("/admin/v1/tokens", {
+      token: session, body: { role: "operator", ttl_seconds: 10 },
+    });
+    check("过短的有效期被拒", tooShort.json?.code === 4001, JSON.stringify(tooShort.json));
+
+    const tokenList = await api("/admin/v1/tokens", { method: "GET", token: session });
+    check("可列出令牌", tokenList.json?.code === 0 && tokenList.json.data.tokens.length >= 2);
+    check("列表不含令牌明文", !JSON.stringify(tokenList.json).includes(roToken));
+
+    const roId = tokenList.json?.data?.tokens?.find((t) => t.name === "只读测试")?.id;
+    const revoke = await api(`/admin/v1/tokens/${roId}/revoke`, { token: session, body: {} });
+    check("可撤销令牌", revoke.json?.code === 0, JSON.stringify(revoke.json));
+
+    const afterRevoke = await api("/admin/v1/licenses", { method: "GET", token: roToken });
+    check("撤销后令牌立即失效（401）", afterRevoke.status === 401, `HTTP ${afterRevoke.status}`);
+
+    const staticOk = await api("/admin/v1/licenses", { method: "GET", token: ADMIN_TOKEN });
+    check("静态 ADMIN_TOKEN 仍可用（兼容既有接入）", staticOk.json?.code === 0);
   }
 
   // ============ 汇总 ============

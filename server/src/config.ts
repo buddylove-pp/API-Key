@@ -51,6 +51,21 @@ export const config = {
   /** 管理接口令牌 */
   adminToken: required("ADMIN_TOKEN"),
 
+  /**
+   * 管理后台的 HTTP Basic Auth 登录门，格式 `用户名:密码`。
+   * 留空则不启用。设置后浏览器打开 /admin 会弹原生登录框。
+   * 与 ADMIN_TOKEN 是两层独立防护，建议都开。
+   */
+  adminBasicAuth: optional("ADMIN_BASIC_AUTH", ""),
+
+  /**
+   * 首次启动时用于创建 root 账户。
+   * ⚠️ 只在 admin_users 表为空时生效；账户已存在则忽略，
+   *    所以改密码必须走后台，改这里不会覆盖。
+   */
+  adminUsername: optional("ADMIN_USERNAME", ""),
+  adminPassword: optional("ADMIN_PASSWORD", ""),
+
   /** 票据签名私钥（PKCS#8 PEM）。私钥泄露 = 授权系统失效，只放服务端环境变量 */
   ticketPrivateKeyPem: normalizePem(required("TICKET_PRIVATE_KEY_PEM")),
 
@@ -73,5 +88,8 @@ export function validateConfig(): void {
   }
   if (!config.ticketPrivateKeyPem.includes("BEGIN PRIVATE KEY")) {
     throw new Error("TICKET_PRIVATE_KEY_PEM 不是合法的 PKCS#8 PEM 私钥");
+  }
+  if (config.adminBasicAuth !== "" && !config.adminBasicAuth.includes(":")) {
+    throw new Error("ADMIN_BASIC_AUTH 格式应为 `用户名:密码`");
   }
 }
