@@ -1,0 +1,11 @@
+# 构建上下文排除项
+.git
+client
+server/node_modules
+server/dist
+server/.env
+server/keys
+**/node_modules
+**/bin
+**/obj
+**/*.md
