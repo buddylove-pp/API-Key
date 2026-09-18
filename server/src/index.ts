@@ -36,7 +36,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const service = new LicenseService(repo, privateKey, publicKey);
+  const service = new LicenseService(repo, privateKey, publicKey, config.ticketMaxTtlDays);
 
   // 首次启动时种下 root 账户（已有账户则跳过，不会覆盖密码）
   if (config.adminUsername !== "" && config.adminPassword !== "") {

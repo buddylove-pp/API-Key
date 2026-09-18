@@ -72,6 +72,13 @@ export const config = {
   publicBaseUrl: optional("PUBLIC_BASE_URL", ""),
   autoMigrate: bool("AUTO_MIGRATE", true),
 
+  /**
+   * 票据（离线容忍窗口）最大天数。
+   * 票据有效期同时受「下次校验时间」与「授权到期」约束，这里只是兜底上限。
+   * 调大 = 更能容忍断网，但用户也能更久不联网；默认 7 天。
+   */
+  ticketMaxTtlDays: num("TICKET_MAX_TTL_DAYS", 7),
+
   rateLimitMax: num("RATE_LIMIT_MAX", 60),
   rateLimitWindowSec: num("RATE_LIMIT_WINDOW_SEC", 60),
 

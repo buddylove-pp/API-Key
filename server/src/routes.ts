@@ -150,6 +150,37 @@ export function buildRouter(deps: RouterDeps): Router {
     ok(res, result);
   }));
 
+  // ============ 定期校验 ============
+
+  /**
+   * 执行一次校验，推进校验周期。
+   * 与心跳的区别：心跳只续票据，校验会推进排期。
+   * 校验不消耗卡密的激活次数。
+   */
+  router.post("/api/v1/check", publicLimiter, wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const ticket = str(body["ticket"]);
+    const deviceFp = body["device_fp"];
+
+    if (!ticket) throw new ServiceError(ErrCode.INVALID_PARAM);
+    if (!isValidDeviceFp(deviceFp)) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const result = await service.check(ticket, deviceFp, ctxOf(req, body));
+    ok(res, result);
+  }));
+
+  /** 只读查询授权状态（不推进排期），客户端用来判断该不该弹校验窗口 */
+  router.post("/api/v1/entitlement", publicLimiter, wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const ticket = str(body["ticket"]);
+    const deviceFp = body["device_fp"];
+
+    if (!ticket) throw new ServiceError(ErrCode.INVALID_PARAM);
+    if (!isValidDeviceFp(deviceFp)) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    ok(res, await service.getEntitlement(ticket, deviceFp));
+  }));
+
   // ============ 自助解绑 ============
 
   router.post("/api/v1/unbind", publicLimiter, wrap(async (req, res) => {
@@ -347,6 +378,10 @@ export function buildRouter(deps: RouterDeps): Router {
       activation_days: Number(body["activation_days"] ?? 365),
       max_unbinds: Number(body["max_unbinds"] ?? 3),
       refund_on_unbind: body["refund_on_unbind"] !== false,
+      check_mode: body["check_mode"] === "interval" ? "interval" : "frequency",
+      check_frequency: Number(body["check_frequency"] ?? 1),
+      check_interval_days: Number(body["check_interval_days"] ?? 0),
+      check_remind_percent: Number(body["check_remind_percent"] ?? 20),
       expires_in_days: body["expires_in_days"] === null || body["expires_in_days"] === undefined
         ? null
         : Number(body["expires_in_days"]),

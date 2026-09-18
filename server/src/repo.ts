@@ -22,6 +22,12 @@ pg.types.setTypeParser(20, (v: string) => Number(v));
 
 export type LicenseStatus = "unused" | "active" | "banned";
 
+/** 校验排期方式 */
+export type CheckMode = "frequency" | "interval";
+
+/** 设备的校验状态：正常 / 进入提醒期 / 已超期停用 */
+export type CheckState = "active" | "due" | "overdue";
+
 /** 软件状态：active 可正常发卡；pending 客户端上报过但管理员未确认；disabled 停用 */
 export type ProductStatus = "active" | "pending" | "disabled";
 
@@ -82,6 +88,14 @@ export interface LicenseRow {
   activation_days: number;
   max_unbinds: number;
   refund_on_unbind: boolean;
+  /** 排期方式：frequency = 按频率等分总时长；interval = 直接指定天数 */
+  check_mode: CheckMode;
+  /** 校验频率：把 activation_days 等分成 N 段；1 = 不做定期校验（仅 frequency 模式） */
+  check_frequency: number;
+  /** 直接指定的校验周期天数；0 = 不做定期校验（仅 interval 模式） */
+  check_interval_days: number;
+  /** 提前提醒比例（%），0 = 不提醒 */
+  check_remind_percent: number;
   activation_count: number;
   unbind_count: number;
   created_at: number;
@@ -95,8 +109,45 @@ export interface BindingRow {
   license_id: number;
   device_fp: string;
   device_name: string | null;
+  /** 首次激活时间 —— 授权期与校验排期的时间锚点，写入后不可变 */
   first_seen: number;
   last_seen: number;
+
+  /** 本设备授权到期 = first_seen + activation_days（激活时一次算定） */
+  entitlement_expires_at: number | null;
+
+  /** 已解析的校验周期（天），0 = 不校验 */
+  check_interval_days: number;
+  check_frequency: number;
+  check_remind_percent: number;
+  /** 上次校验时间（激活时 = first_seen） */
+  last_check_at: number | null;
+  /** 计划下次校验时间；NULL = 不校验 */
+  next_check_at: number | null;
+  check_state: CheckState;
+  overdue_since: number | null;
+}
+
+/** 可更新的排期字段 */
+export interface BindingSchedulePatch {
+  entitlement_expires_at?: number;
+  check_frequency?: number;
+  check_interval_days?: number;
+  check_remind_percent?: number;
+  last_check_at?: number;
+  next_check_at?: number | null;
+  check_state?: CheckState;
+  overdue_since?: number | null;
+}
+
+/** 创建绑定时的授权与排期参数 */
+export interface BindingEntitlement {
+  entitlement_expires_at: number;
+  check_frequency: number;
+  check_interval_days: number;
+  check_remind_percent: number;
+  last_check_at: number;
+  next_check_at: number | null;
 }
 
 export interface AuditEntry {
@@ -118,6 +169,10 @@ export interface CreateLicenseInput {
   activation_days: number;
   max_unbinds: number;
   refund_on_unbind: boolean;
+  check_mode: CheckMode;
+  check_frequency: number;
+  check_interval_days: number;
+  check_remind_percent: number;
   expires_at: number | null;
   note: string | null;
   created_at: number;
@@ -148,9 +203,16 @@ export interface Repo {
 
   listBindings(licenseId: number): Promise<BindingRow[]>;
   findBinding(licenseId: number, deviceFp: string): Promise<BindingRow | null>;
-  createBinding(licenseId: number, deviceFp: string, deviceName: string | null, at: number): Promise<void>;
+  createBinding(
+    licenseId: number, deviceFp: string, deviceName: string | null,
+    at: number, entitlement: BindingEntitlement,
+  ): Promise<void>;
   deleteBinding(licenseId: number, deviceFp: string): Promise<boolean>;
   touchBinding(licenseId: number, deviceFp: string, at: number): Promise<void>;
+  /** 更新某台设备的授权与校验排期 */
+  updateBindingSchedule(
+    licenseId: number, deviceFp: string, patch: BindingSchedulePatch,
+  ): Promise<void>;
 
   audit(entry: AuditEntry): Promise<void>;
   listAudit(licenseId: number, limit: number): Promise<AuditEntry[]>;
@@ -234,6 +296,10 @@ export class MemoryRepo implements Repo {
       activation_days: input.activation_days,
       max_unbinds: input.max_unbinds,
       refund_on_unbind: input.refund_on_unbind,
+      check_mode: input.check_mode,
+      check_frequency: input.check_frequency,
+      check_interval_days: input.check_interval_days,
+      check_remind_percent: input.check_remind_percent,
       activation_count: 0,
       unbind_count: 0,
       created_at: input.created_at,
@@ -310,7 +376,10 @@ export class MemoryRepo implements Repo {
     return b ? { ...b } : null;
   }
 
-  async createBinding(licenseId: number, deviceFp: string, deviceName: string | null, at: number): Promise<void> {
+  async createBinding(
+    licenseId: number, deviceFp: string, deviceName: string | null,
+    at: number, entitlement: BindingEntitlement,
+  ): Promise<void> {
     this.bindings.push({
       id: this.nextBindingId++,
       license_id: licenseId,
@@ -318,7 +387,30 @@ export class MemoryRepo implements Repo {
       device_name: deviceName,
       first_seen: at,
       last_seen: at,
+      entitlement_expires_at: entitlement.entitlement_expires_at,
+      check_frequency: entitlement.check_frequency,
+      check_interval_days: entitlement.check_interval_days,
+      check_remind_percent: entitlement.check_remind_percent,
+      last_check_at: entitlement.last_check_at,
+      next_check_at: entitlement.next_check_at,
+      check_state: "active",
+      overdue_since: null,
     });
+  }
+
+  async updateBindingSchedule(
+    licenseId: number, deviceFp: string, patch: BindingSchedulePatch,
+  ): Promise<void> {
+    const b = this.bindings.find((x) => x.license_id === licenseId && x.device_fp === deviceFp);
+    if (!b) return;
+    if (patch.entitlement_expires_at !== undefined) b.entitlement_expires_at = patch.entitlement_expires_at;
+    if (patch.check_frequency !== undefined) b.check_frequency = patch.check_frequency;
+    if (patch.check_interval_days !== undefined) b.check_interval_days = patch.check_interval_days;
+    if (patch.check_remind_percent !== undefined) b.check_remind_percent = patch.check_remind_percent;
+    if (patch.last_check_at !== undefined) b.last_check_at = patch.last_check_at;
+    if (patch.next_check_at !== undefined) b.next_check_at = patch.next_check_at;
+    if (patch.check_state !== undefined) b.check_state = patch.check_state;
+    if (patch.overdue_since !== undefined) b.overdue_since = patch.overdue_since;
   }
 
   async deleteBinding(licenseId: number, deviceFp: string): Promise<boolean> {
@@ -571,14 +663,17 @@ export class PgRepo implements Repo {
     const { rows } = await this.pool.query<LicenseRow>(
       `INSERT INTO licenses
          (key_hash, key_prefix, product, status, max_devices, max_activations, activation_days,
-          max_unbinds, refund_on_unbind, activation_count, unbind_count,
+          max_unbinds, refund_on_unbind, check_mode, check_frequency, check_interval_days,
+          check_remind_percent, activation_count, unbind_count,
           created_at, first_activated_at, expires_at, note)
-       VALUES ($1,$2,$3,'unused',$4,$5,$6,$7,$8,0,0,$9,NULL,$10,$11)
+       VALUES ($1,$2,$3,'unused',$4,$5,$6,$7,$8,$9,$10,$11,$12,0,0,$13,NULL,$14,$15)
        RETURNING *`,
       [
         input.key_hash, input.key_prefix, input.product,
         input.max_devices, input.max_activations,
         input.activation_days, input.max_unbinds, input.refund_on_unbind,
+        input.check_mode, input.check_frequency, input.check_interval_days,
+        input.check_remind_percent,
         input.created_at, input.expires_at, input.note,
       ],
     );
@@ -683,12 +778,64 @@ export class PgRepo implements Repo {
     return rows[0] ?? null;
   }
 
-  async createBinding(licenseId: number, deviceFp: string, deviceName: string | null, at: number): Promise<void> {
+  async createBinding(
+    licenseId: number, deviceFp: string, deviceName: string | null,
+    at: number, entitlement: BindingEntitlement,
+  ): Promise<void> {
     await this.pool.query(
-      `INSERT INTO bindings (license_id, device_fp, device_name, first_seen, last_seen)
-       VALUES ($1,$2,$3,$4,$4)
-       ON CONFLICT (license_id, device_fp) DO UPDATE SET last_seen = $4`,
-      [licenseId, deviceFp, deviceName, at],
+      `INSERT INTO bindings
+         (license_id, device_fp, device_name, first_seen, last_seen,
+          entitlement_expires_at, check_frequency, check_interval_days, check_remind_percent,
+          last_check_at, next_check_at, check_state, overdue_since)
+       VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,'active',NULL)
+       ON CONFLICT (license_id, device_fp) DO UPDATE
+         SET last_seen = $4,
+             entitlement_expires_at = $5,
+             check_frequency = $6,
+             check_interval_days = $7,
+             check_remind_percent = $8,
+             last_check_at = $9,
+             next_check_at = $10,
+             check_state = 'active',
+             overdue_since = NULL`,
+      [
+        licenseId, deviceFp, deviceName, at,
+        entitlement.entitlement_expires_at,
+        entitlement.check_frequency,
+        entitlement.check_interval_days,
+        entitlement.check_remind_percent,
+        entitlement.last_check_at,
+        entitlement.next_check_at,
+      ],
+    );
+  }
+
+  async updateBindingSchedule(
+    licenseId: number, deviceFp: string, patch: BindingSchedulePatch,
+  ): Promise<void> {
+    const map: Record<string, unknown> = {
+      entitlement_expires_at: patch.entitlement_expires_at,
+      check_frequency: patch.check_frequency,
+      check_interval_days: patch.check_interval_days,
+      check_remind_percent: patch.check_remind_percent,
+      last_check_at: patch.last_check_at,
+      next_check_at: patch.next_check_at,
+      check_state: patch.check_state,
+      overdue_since: patch.overdue_since,
+    };
+
+    const sets: string[] = [];
+    const params: unknown[] = [licenseId, deviceFp];
+    for (const [col, val] of Object.entries(map)) {
+      if (val === undefined) continue;
+      params.push(val);
+      sets.push(`${col} = $${params.length}`);
+    }
+    if (sets.length === 0) return;
+
+    await this.pool.query(
+      `UPDATE bindings SET ${sets.join(", ")} WHERE license_id = $1 AND device_fp = $2`,
+      params,
     );
   }
 

@@ -267,7 +267,14 @@ async function run() {
     check("票据含过期时间", typeof v.payload?.exp === "number" && v.payload.exp > v.payload.iat);
 
     const days = (v.payload.exp - v.payload.iat) / 86400;
-    check("票据有效期为 30 天", Math.abs(days - 30) < 0.01, `实际 ${days} 天`);
+    check("票据有效期为 7 天（离线容忍窗口上限）", Math.abs(days - 7) < 0.01, `实际 ${days} 天`);
+
+    const ent = a.json?.data?.entitlement;
+    check("返回了授权信息", ent !== undefined && ent !== null);
+    check("授权期为 30 天", Math.abs((ent.expires_at - ent.activated_at) / 86400 - 30) < 0.01,
+      `实际 ${(ent.expires_at - ent.activated_at) / 86400} 天`);
+    check("票据内带授权到期时间", v.payload?.eat === ent.expires_at);
+    check("频率 1 → 不做定期校验", ent?.next_check_at === null, JSON.stringify(ent));
 
     check("激活计数为 1", a.json?.data?.license?.activation_count === 1);
     check("返回了服务端时间", typeof a.json?.data?.server_time === "number");
@@ -502,6 +509,115 @@ async function run() {
 
     const staticOk = await api("/admin/v1/licenses", { method: "GET", token: ADMIN_TOKEN });
     check("静态 ADMIN_TOKEN 仍可用（兼容既有接入）", staticOk.json?.code === 0);
+  }
+
+  section("14. 定期校验：定频率模式");
+  let ckKey, ckTicket;
+  {
+    const g = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: {
+        product: PRODUCT, count: 1, max_devices: 1, max_activations: 1,
+        activation_days: 100, max_unbinds: 3,
+        check_mode: "frequency", check_frequency: 10, check_remind_percent: 20,
+        note: "定期校验测试",
+      },
+    });
+    check("可生成带校验排期的卡密", g.json?.code === 0, JSON.stringify(g.json));
+    ckKey = g.json?.data?.keys?.[0];
+
+    const a = await activate({ license_key: ckKey, device_fp: FP_C });
+    check("激活成功", a.json?.code === 0, JSON.stringify(a.json));
+
+    const ent = a.json?.data?.entitlement;
+    const d = (x, base) => Math.round((x - base) / 86400);
+
+    check("★ 100 天 ÷ 10 → 周期 10 天", ent?.check_interval_days === 10, JSON.stringify(ent));
+    check("★ 首次计划在第 10 天", d(ent.next_check_at, ent.activated_at) === 10);
+    check("★ 提醒在第 8 天（提前 20%）", d(ent.remind_at, ent.activated_at) === 8);
+    check("状态为 active", ent?.state === "active");
+    check("授权期为 100 天", d(ent.expires_at, ent.activated_at) === 100);
+    check("票据被离线窗口上限截断为 7 天",
+      d(a.json.data.expires_at, a.json.data.server_time) === 7,
+      `实际 ${d(a.json.data.expires_at, a.json.data.server_time)} 天`);
+
+    ckTicket = a.json?.data?.ticket;
+  }
+
+  section("15. 定期校验：执行校验与基准规则");
+  {
+    const q = await api("/api/v1/entitlement", { body: { ticket: ckTicket, device_fp: FP_C } });
+    check("只读查询授权状态成功", q.json?.code === 0, JSON.stringify(q.json));
+    const before = q.json?.data?.next_check_at;
+
+    const c1 = await api("/api/v1/check", { body: { ticket: ckTicket, device_fp: FP_C } });
+    check("校验成功", c1.json?.code === 0, JSON.stringify(c1.json));
+    check("本次推进了校验周期", c1.json?.data?.advanced === true);
+    check("返回了上次计划时间", c1.json?.data?.previous_next_check_at === before);
+
+    const ent = c1.json?.data?.entitlement;
+    const d = (x, base) => Math.round((x - base) / 86400);
+    // 立即校验属于「提前」→ 基准不变，下次 = 原计划第10天 + 10天 = 第20天
+    check("★ 提前校验后下次仍在第 20 天（基准不变）",
+      d(ent.next_check_at, ent.activated_at) === 20,
+      `实际第 ${d(ent.next_check_at, ent.activated_at)} 天`);
+
+    check("校验返回新票据", typeof c1.json?.data?.ticket === "string");
+    check("校验不消耗激活次数", c1.json?.data?.entitlement !== undefined);
+
+    // 新票据可离线验签
+    const nv = verifyTicketOffline(c1.json?.data?.ticket);
+    check("新票据可验签", nv.ok, nv.reason);
+    check("票据内带下次校验时间", nv.payload?.nca === ent.next_check_at);
+    check("票据内带授权到期时间", nv.payload?.eat === ent.expires_at);
+
+    // 校验后状态回到 active
+    const after = await api("/api/v1/entitlement", { body: { ticket: c1.json.data.ticket, device_fp: FP_C } });
+    check("校验后状态为 active", after.json?.data?.state === "active");
+  }
+
+  section("16. 定期校验：定时间模式");
+  {
+    const g = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: {
+        product: PRODUCT, count: 1, max_devices: 1, max_activations: 1,
+        activation_days: 30, check_mode: "interval", check_interval_days: 7,
+        check_remind_percent: 0,
+      },
+    });
+    const key = g.json?.data?.keys?.[0];
+    check("定时间模式可生成卡密", typeof key === "string");
+
+    const a = await activate({ license_key: key, device_fp: FP_A });
+    const ent = a.json?.data?.entitlement;
+    const d = (x, base) => Math.round((x - base) / 86400);
+
+    check("★ 总时长 30 天也能设 7 天周期", ent?.check_interval_days === 7, JSON.stringify(ent));
+    check("下次校验在第 7 天", d(ent.next_check_at, ent.activated_at) === 7);
+    check("★ 提醒比例 0 → 不提醒", ent?.remind_at === null);
+    check("授权期仍为 30 天", d(ent.expires_at, ent.activated_at) === 30);
+  }
+
+  section("17. 校验参数校验");
+  {
+    const bad = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: PRODUCT, count: 1, check_frequency: 0 },
+    });
+    check("频率 0 被拒", bad.json?.code === 4001, JSON.stringify(bad.json));
+
+    const bad2 = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: PRODUCT, count: 1, check_remind_percent: 200 },
+    });
+    check("提醒比例超过 90 被拒", bad2.json?.code === 4001, JSON.stringify(bad2.json));
+
+    const bad3 = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: PRODUCT, count: 1, check_interval_days: 99999 },
+    });
+    check("周期天数超上限被拒", bad3.json?.code === 4001, JSON.stringify(bad3.json));
   }
 
   // ============ 汇总 ============

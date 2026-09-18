@@ -107,8 +107,19 @@ export interface TicketPayload {
   fp: string;
   /** 签发时间（Unix 秒） */
   iat: number;
-  /** 过期时间（Unix 秒） */
+  /** 票据过期时间（Unix 秒）—— 短周期，用于离线容忍窗口 */
   exp: number;
+
+  // ---- 以下为授权与校验排期，客户端可离线据此判断是否该弹校验窗口 ----
+
+  /** 首次激活时间（授权时间锚点） */
+  aat: number;
+  /** 本设备授权到期时间 */
+  eat: number;
+  /** 计划下次校验时间；null = 不做定期校验 */
+  nca: number | null;
+  /** 提醒开始时间；null = 不提醒 */
+  rat: number | null;
 }
 
 /**
@@ -175,7 +186,18 @@ export function verifyTicket(publicKey: KeyObject, ticket: string): TicketPayloa
     return null;
   }
 
-  return { v: p.v, lid: p.lid, fp: p.fp, iat: p.iat, exp: p.exp };
+  return {
+    v: p.v,
+    lid: p.lid,
+    fp: p.fp,
+    iat: p.iat,
+    exp: p.exp,
+    // 老版本票据没有这些字段，退回合理默认值，保证向后兼容
+    aat: typeof p.aat === "number" ? p.aat : p.iat,
+    eat: typeof p.eat === "number" ? p.eat : p.exp,
+    nca: typeof p.nca === "number" ? p.nca : null,
+    rat: typeof p.rat === "number" ? p.rat : null,
+  };
 }
 
 /** 设备指纹格式校验：只接受 32~64 位十六进制 */

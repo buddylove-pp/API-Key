@@ -251,6 +251,34 @@
           <button id="btnGen" class="primary">生成</button>
         </div>
 
+        <div class="row" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)">
+          <div class="field">
+            <label>定期校验方式</label>
+            <select id="gCheckMode" style="width:auto">
+              <option value="frequency">定频率（按总时长等分）</option>
+              <option value="interval">定时间（直接指定天数）</option>
+            </select>
+          </div>
+          <div class="field" id="gFreqWrap">
+            <label>校验频率</label>
+            <input id="gFrequency" type="number" value="1" min="1" max="1000" style="width:120px">
+          </div>
+          <div class="field" id="gIntervalWrap" hidden>
+            <label>校验周期（天）</label>
+            <input id="gIntervalDays" type="number" value="10" min="0" max="3650" style="width:120px">
+          </div>
+          <div class="field">
+            <label>提前提醒比例（%）</label>
+            <input id="gRemind" type="number" value="20" min="0" max="90" style="width:120px">
+          </div>
+          <div class="hint" id="gCheckPreview" style="align-self:center;flex:1;min-width:180px"></div>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          定频率：把「每次激活授予天数」等分成 N 段，每段到期校验一次；填 1 表示不做定期校验。<br>
+          定时间：直接指定每 D 天校验一次，与总时长无关。<br>
+          校验不消耗激活次数；超期未校验会强制停用，重新校验后恢复。
+        </div>
+
         <div class="row" style="margin-top:12px">
           <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer">
             <input id="gRefund" type="checkbox" checked style="width:auto">
@@ -731,6 +759,50 @@
     await loadProducts();
   }
 
+  // ---------- 定期校验设置 ----------
+
+  /** 解析当前表单的有效校验周期（天）。0 = 不校验 */
+  function currentCheckSettings() {
+    var mode = $("gCheckMode").value;
+    var activationDays = Number($("gDays").value) || 365;
+    var freq = Number($("gFrequency").value) || 1;
+    var interval = Number($("gIntervalDays").value) || 0;
+
+    var resolved;
+    if (mode === "interval") {
+      resolved = interval > 0 ? Math.floor(interval) : 0;
+    } else {
+      // 频率 1 = 不校验（激活那一刻已经算第一次）
+      resolved = freq > 1 ? Math.floor(activationDays / freq) : 0;
+    }
+
+    return { mode: mode, freq: freq, interval: interval, resolved: resolved, activationDays: activationDays };
+  }
+
+  function updateCheckPreview() {
+    var s = currentCheckSettings();
+    $("gFreqWrap").hidden = s.mode !== "frequency";
+    $("gIntervalWrap").hidden = s.mode !== "interval";
+
+    var el = $("gCheckPreview");
+    if (s.resolved <= 0) {
+      el.textContent = "→ 不做定期校验（激活那一次即算完成）";
+      return;
+    }
+
+    var times = Math.max(1, Math.floor(s.activationDays / s.resolved));
+    var txt = "→ 每 " + s.resolved + " 天校验一次，授权期内共 " + times + " 次";
+
+    var remind = Number($("gRemind").value) || 0;
+    if (remind > 0) {
+      var ahead = s.resolved * remind / 100;
+      txt += "；提前 " + (Math.round(ahead * 10) / 10) + " 天提醒";
+    } else {
+      txt += "；不提前提醒";
+    }
+    el.textContent = txt;
+  }
+
   // ---------- 生成卡密 ----------
 
   async function generate() {
@@ -742,6 +814,7 @@
     btn.disabled = true;
 
     var expiresRaw = $("gExpires").value.trim();
+    var ck = currentCheckSettings();
     var r = await api("/licenses/generate", {
       body: {
         product: product,
@@ -751,6 +824,10 @@
         activation_days: Number($("gDays").value) || 365,
         max_unbinds: Number($("gUnbinds").value) || 0,
         refund_on_unbind: $("gRefund").checked,
+        check_mode: ck.mode,
+        check_frequency: ck.freq,
+        check_interval_days: ck.interval,
+        check_remind_percent: Number($("gRemind").value) || 0,
         expires_in_days: expiresRaw === "" ? null : Number(expiresRaw),
         note: $("gNote").value.trim() || null,
       },
@@ -1116,6 +1193,11 @@
   });
 
   $("btnGen").onclick = generate;
+  ["gCheckMode", "gFrequency", "gIntervalDays", "gRemind", "gDays"].forEach(function (id) {
+    $(id).addEventListener("input", updateCheckPreview);
+    $(id).addEventListener("change", updateCheckPreview);
+  });
+  updateCheckPreview();
   $("btnCsv").onclick = downloadCsv;
   $("btnCopyKeys").onclick = function () {
     navigator.clipboard.writeText(state.lastKeys.join("\n")).then(function () {

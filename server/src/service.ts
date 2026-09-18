@@ -18,6 +18,15 @@ import {
 } from "./crypto.js";
 import type { BindingRow, LicenseRow, ProductRow, ProductStatus, Repo } from "./repo.js";
 import {
+  SECONDS_PER_DAY,
+  advanceNextCheck,
+  computeRemindAt,
+  deriveState,
+  initialPlan,
+  resolveIntervalDays,
+  type CheckMode,
+} from "./checkplan.js";
+import {
   DEFAULT_TOKEN_TTL_SECONDS,
   MAX_TOKEN_TTL_SECONDS,
   generateAdminToken,
@@ -35,8 +44,6 @@ export const LOGIN_SESSION_TTL_SECONDS = 12 * 60 * 60;
 
 export const nowSec = (): number => Math.floor(Date.now() / 1000);
 
-const SECONDS_PER_DAY = 86_400;
-
 // ============ 错误码 ============
 // 客户端按 code 做本地化提示，不要依赖 msg 文案
 
@@ -51,6 +58,8 @@ export const ErrCode = {
   DEVICE_LIMIT_REACHED: 1005,
   PRODUCT_MISMATCH: 1006,
   PRODUCT_NOT_REGISTERED: 1007,
+  /** 本设备授权已到期（校验也救不回来，只能重新激活） */
+  ENTITLEMENT_EXPIRED: 1008,
 
   TICKET_INVALID: 2001,
 
@@ -71,6 +80,7 @@ const ERR_MESSAGE: Record<number, string> = {
   [ErrCode.DEVICE_LIMIT_REACHED]: "绑定设备数已达上限，请先解绑其他设备",
   [ErrCode.PRODUCT_MISMATCH]: "该卡密不适用于本软件",
   [ErrCode.PRODUCT_NOT_REGISTERED]: "该软件尚未在后台启用，请联系管理员确认",
+  [ErrCode.ENTITLEMENT_EXPIRED]: "本设备授权已到期，请重新使用卡密激活",
   [ErrCode.TICKET_INVALID]: "授权已失效，请重新激活",
   [ErrCode.NOT_BOUND]: "该设备未绑定到此卡密",
   [ErrCode.UNBIND_EXHAUSTED]: "解绑次数已用尽，请联系客服",
@@ -104,6 +114,48 @@ export interface ActivateResult extends TicketInfo {
     unbind_count: number;
     expires_at: number | null;
   };
+  /** 本设备的授权与校验排期 */
+  entitlement: EntitlementInfo;
+}
+
+/**
+ * 本设备的授权状态。客户端据此决定：
+ *   state = active   → 正常使用
+ *   state = due      → 进入提醒期，可提示用户去校验（用户可跳过）
+ *   state = overdue  → 必须校验，否则强制停用
+ */
+export interface EntitlementInfo {
+  /** 首次激活时间（时间锚点） */
+  activated_at: number;
+  /** 本设备授权到期 */
+  expires_at: number;
+  /** 授权剩余天数（向上取整，最小 0） */
+  days_left: number;
+
+  check_mode: CheckMode;
+  check_frequency: number;
+  check_interval_days: number;
+  check_remind_percent: number;
+
+  /** 上次校验时间 */
+  last_check_at: number;
+  /** 计划下次校验时间；null = 不校验 */
+  next_check_at: number | null;
+  /** 提醒开始时间；null = 不提醒 */
+  remind_at: number | null;
+
+  state: "active" | "due" | "overdue";
+  /** 是否已到必须校验的时刻（超期即强制停用） */
+  must_check: boolean;
+}
+
+/** 校验结果：票据 + 新的排期 */
+export interface CheckResult extends TicketInfo {
+  entitlement: EntitlementInfo;
+  /** 本次是否推进了校验周期 */
+  advanced: boolean;
+  /** 上次计划校验时间，便于客户端核对 */
+  previous_next_check_at: number | null;
 }
 
 export interface GenerateOptions {
@@ -114,6 +166,14 @@ export interface GenerateOptions {
   activation_days: number;
   max_unbinds: number;
   refund_on_unbind: boolean;
+  /** 校验排期方式：frequency 定频率 / interval 定时间 */
+  check_mode: CheckMode;
+  /** 定频率模式：把 activation_days 等分成 N 段；1 = 不校验 */
+  check_frequency: number;
+  /** 定时间模式：直接指定每 D 天校验一次；0 = 不校验 */
+  check_interval_days: number;
+  /** 提前提醒比例（%），0 = 不提醒 */
+  check_remind_percent: number;
   /** 卡密绝对有效期（天）。null = 不限制 */
   expires_in_days: number | null;
   note: string | null;
@@ -131,33 +191,106 @@ export class LicenseService {
     private readonly repo: Repo,
     private readonly privateKey: KeyObject,
     private readonly publicKey: KeyObject,
+    /** 票据（离线容忍窗口）的最大天数。默认 7 天 */
+    private readonly ticketMaxTtlDays: number = 7,
   ) {}
 
   // ---------- 内部工具 ----------
 
   /**
-   * 票据过期时间 = min(现在 + 本次激活授予天数, 卡密绝对到期时间)
-   * 这样「每次激活给 N 天」和「卡密本身某天作废」两条规则能同时生效
+   * 票据有效期 = 离线容忍窗口。
+   *
+   * ⚠️ 必须被「下次校验时间」截断：票据是客户端离线运行的凭据，
+   * 如果它能覆盖过整个校验周期，用户只要断网就永远不用校验了。
+   *
+   * 取三者最小值：
+   *   1. 授权到期时间
+   *   2. 下次校验时间（没设定期校验时为 ∞）
+   *   3. now + ticketMaxTtlDays（兜底上限，防止 interval 设得过大）
    */
-  private computeTicketExpiry(lic: LicenseRow, now: number): number {
-    let exp = now + lic.activation_days * SECONDS_PER_DAY;
-    if (lic.expires_at !== null) exp = Math.min(exp, lic.expires_at);
-    return exp;
+  private computeTicketExpiry(lic: LicenseRow, binding: BindingRow, now: number): number {
+    let exp = binding.entitlement_expires_at
+      ?? now + lic.activation_days * SECONDS_PER_DAY;
+
+    if (binding.next_check_at !== null) exp = Math.min(exp, binding.next_check_at);
+
+    const cap = now + this.ticketMaxTtlDays * SECONDS_PER_DAY;
+    return Math.min(exp, cap);
   }
 
-  private issueTicket(lic: LicenseRow, deviceFp: string, now: number): TicketInfo {
-    const exp = this.computeTicketExpiry(lic, now);
+  private issueTicket(
+    lic: LicenseRow, deviceFp: string, now: number, binding: BindingRow,
+  ): TicketInfo {
+    const exp = this.computeTicketExpiry(lic, binding, now);
     const payload: TicketPayload = {
       v: TICKET_VERSION,
       lid: lic.id,
       fp: deviceFp,
       iat: now,
       exp,
+      aat: binding.first_seen,
+      eat: binding.entitlement_expires_at ?? exp,
+      nca: binding.next_check_at,
+      rat: binding.next_check_at === null
+        ? null
+        : computeRemindAt(
+            binding.next_check_at,
+            binding.check_interval_days,
+            binding.check_remind_percent,
+          ),
     };
     return {
       ticket: signTicket(this.privateKey, payload),
       expires_at: exp,
       server_time: now,
+    };
+  }
+
+  /** 组装给客户端的授权状态 */
+  private buildEntitlement(lic: LicenseRow, binding: BindingRow, now: number): EntitlementInfo {
+    const entExpires = binding.entitlement_expires_at
+      ?? binding.first_seen + lic.activation_days * SECONDS_PER_DAY;
+
+    const remindAt = binding.next_check_at === null
+      ? null
+      : computeRemindAt(
+          binding.next_check_at,
+          binding.check_interval_days,
+          binding.check_remind_percent,
+        );
+
+    const state = deriveState(now, binding.next_check_at, remindAt, entExpires);
+
+    return {
+      activated_at: binding.first_seen,
+      expires_at: entExpires,
+      days_left: Math.max(0, Math.ceil((entExpires - now) / SECONDS_PER_DAY)),
+      check_mode: lic.check_mode,
+      check_frequency: binding.check_frequency,
+      check_interval_days: binding.check_interval_days,
+      check_remind_percent: binding.check_remind_percent,
+      last_check_at: binding.last_check_at ?? binding.first_seen,
+      next_check_at: binding.next_check_at,
+      remind_at: remindAt,
+      state,
+      must_check: state === "overdue",
+    };
+  }
+
+  /** 激活时算出本设备的授权期与首次校验计划 */
+  private buildInitialEntitlement(lic: LicenseRow, at: number) {
+    const intervalDays = resolveIntervalDays(
+      lic.check_mode, lic.activation_days, lic.check_frequency, lic.check_interval_days,
+    );
+    const plan = initialPlan(at, intervalDays, lic.check_remind_percent);
+
+    return {
+      entitlement_expires_at: at + lic.activation_days * SECONDS_PER_DAY,
+      check_frequency: lic.check_frequency,
+      check_interval_days: intervalDays,
+      check_remind_percent: lic.check_remind_percent,
+      last_check_at: at,
+      next_check_at: plan.nextCheckAt,
     };
   }
 
@@ -210,7 +343,7 @@ export class LicenseService {
         license_id: lic.id, event: "activate", device_fp: deviceFp,
         ip: ctx.ip, app_version: ctx.appVersion, detail: "idempotent", created_at: now,
       });
-      return this.buildActivateResult(lic, deviceFp, now);
+      return this.buildActivateResult(lic, deviceFp, now, existing);
     }
 
     // 设备数上限
@@ -224,7 +357,10 @@ export class LicenseService {
       throw new ServiceError(ErrCode.ACTIVATION_EXHAUSTED);
     }
 
-    await this.repo.createBinding(lic.id, deviceFp, deviceName, now);
+    // 授权期与首次校验计划在激活这一刻一次算定，之后不再受卡密自身有效期影响
+    await this.repo.createBinding(
+      lic.id, deviceFp, deviceName, now, this.buildInitialEntitlement(lic, now),
+    );
     await this.repo.incrementActivation(lic.id, now);
 
     await this.repo.audit({
@@ -232,13 +368,16 @@ export class LicenseService {
       ip: ctx.ip, app_version: ctx.appVersion, detail: null, created_at: now,
     });
 
-    // 重新读取，拿到自增后的计数
+    // 重新读取，拿到自增后的计数与刚写入的排期
     const fresh = (await this.repo.findLicenseById(lic.id)) ?? lic;
-    return this.buildActivateResult(fresh, deviceFp, now);
+    const binding = (await this.repo.findBinding(lic.id, deviceFp))!;
+    return this.buildActivateResult(fresh, deviceFp, now, binding);
   }
 
-  private buildActivateResult(lic: LicenseRow, deviceFp: string, now: number): ActivateResult {
-    const t = this.issueTicket(lic, deviceFp, now);
+  private buildActivateResult(
+    lic: LicenseRow, deviceFp: string, now: number, binding: BindingRow,
+  ): ActivateResult {
+    const t = this.issueTicket(lic, deviceFp, now, binding);
     return {
       ...t,
       license: {
@@ -250,14 +389,20 @@ export class LicenseService {
         unbind_count: lic.unbind_count,
         expires_at: lic.expires_at,
       },
+      entitlement: this.buildEntitlement(lic, binding, now),
     };
   }
 
   // ---------- 心跳续期 ----------
 
-  async heartbeat(ticket: string, deviceFp: string, ctx: CallContext): Promise<TicketInfo> {
-    const now = nowSec();
-
+  /**
+   * 解析会话：验票据 + 取卡密与设备绑定。
+   *
+   * ⚠️ 只拦「封禁」，**不拦卡密自身过期** —— 卡密过期只是不能再激活，
+   * 已激活的设备在授权期内仍要能校验（这是明确要求）。
+   * 授权是否过期由调用方单独判断。
+   */
+  private async resolveSession(ticket: string, deviceFp: string, now: number) {
     const payload = verifyTicket(this.publicKey, ticket);
     if (!payload) throw new ServiceError(ErrCode.TICKET_INVALID, 403);
     if (payload.v !== TICKET_VERSION) throw new ServiceError(ErrCode.TICKET_INVALID, 403);
@@ -268,11 +413,24 @@ export class LicenseService {
     const lic = await this.repo.findLicenseById(payload.lid);
     if (!lic) throw new ServiceError(ErrCode.TICKET_INVALID, 403);
 
-    // 这里是吊销生效点：封禁 / 过期 / 被解绑，都会在下一次心跳被踢掉
-    this.assertUsable(lic, now);
+    // 吊销生效点：封禁后下一次心跳/校验即被踢掉
+    if (lic.status === "banned") throw new ServiceError(ErrCode.LICENSE_BANNED, 403);
 
     const binding = await this.repo.findBinding(lic.id, deviceFp);
     if (!binding) throw new ServiceError(ErrCode.TICKET_INVALID, 403);
+
+    return { lic, binding, payload };
+  }
+
+  /** 本设备的授权到期时间 */
+  private entitlementExpiryOf(lic: LicenseRow, binding: BindingRow): number {
+    return binding.entitlement_expires_at
+      ?? binding.first_seen + lic.activation_days * SECONDS_PER_DAY;
+  }
+
+  async heartbeat(ticket: string, deviceFp: string, ctx: CallContext): Promise<TicketInfo> {
+    const now = nowSec();
+    const { lic, binding } = await this.resolveSession(ticket, deviceFp, now);
 
     await this.repo.touchBinding(lic.id, deviceFp, now);
     await this.repo.audit({
@@ -280,7 +438,73 @@ export class LicenseService {
       ip: ctx.ip, app_version: ctx.appVersion, detail: null, created_at: now,
     });
 
-    return this.issueTicket(lic, deviceFp, now);
+    return this.issueTicket(lic, deviceFp, now, binding);
+  }
+
+  /**
+   * 定期校验。
+   *
+   * 与心跳的区别：**校验会推进校验周期**，心跳只是续票据。
+   * 校验不消耗卡密的激活次数 —— 只有重新激活才消耗。
+   */
+  async check(ticket: string, deviceFp: string, ctx: CallContext): Promise<CheckResult> {
+    const now = nowSec();
+    const { lic, binding } = await this.resolveSession(ticket, deviceFp, now);
+
+    const entExpires = this.entitlementExpiryOf(lic, binding);
+    // 授权本身已到期 → 校验也救不回来，只能重新激活
+    if (now >= entExpires) {
+      throw new ServiceError(ErrCode.ENTITLEMENT_EXPIRED, 403);
+    }
+
+    const previousNext = binding.next_check_at;
+    let advanced = false;
+
+    if (previousNext !== null && binding.check_interval_days > 0) {
+      // 提前或准时 → 以原计划时间为基准；超期 → 以实际校验时间为基准
+      const next = advanceNextCheck(previousNext, now, binding.check_interval_days);
+      await this.repo.updateBindingSchedule(lic.id, deviceFp, {
+        last_check_at: now,
+        next_check_at: next,
+        check_state: "active",
+        overdue_since: null,
+      });
+      advanced = true;
+    } else {
+      // 没设定期校验的卡密，校验只刷新一次记录
+      await this.repo.updateBindingSchedule(lic.id, deviceFp, {
+        last_check_at: now,
+        check_state: "active",
+        overdue_since: null,
+      });
+    }
+
+    await this.repo.touchBinding(lic.id, deviceFp, now);
+    await this.repo.audit({
+      license_id: lic.id, event: "check", device_fp: deviceFp,
+      ip: ctx.ip, app_version: ctx.appVersion,
+      detail: previousNext === null
+        ? "no-schedule"
+        : `prev=${previousNext} now=${now} advanced=${advanced}`,
+      created_at: now,
+    });
+
+    const fresh = (await this.repo.findBinding(lic.id, deviceFp))!;
+    const t = this.issueTicket(lic, deviceFp, now, fresh);
+
+    return {
+      ...t,
+      entitlement: this.buildEntitlement(lic, fresh, now),
+      advanced,
+      previous_next_check_at: previousNext,
+    };
+  }
+
+  /** 只读查询授权状态，不推进任何排期 */
+  async getEntitlement(ticket: string, deviceFp: string): Promise<EntitlementInfo> {
+    const now = nowSec();
+    const { lic, binding } = await this.resolveSession(ticket, deviceFp, now);
+    return this.buildEntitlement(lic, binding, now);
   }
 
   // ---------- 解绑 ----------
@@ -354,6 +578,20 @@ export class LicenseService {
       throw new ServiceError(ErrCode.PRODUCT_NOT_REGISTERED);
     }
 
+    // 校验排期参数合法性
+    if (opts.check_mode !== "frequency" && opts.check_mode !== "interval") {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (!Number.isFinite(opts.check_frequency) || opts.check_frequency < 1 || opts.check_frequency > 1000) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (!Number.isFinite(opts.check_interval_days) || opts.check_interval_days < 0 || opts.check_interval_days > 3650) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (!Number.isFinite(opts.check_remind_percent) || opts.check_remind_percent < 0 || opts.check_remind_percent > 90) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+
     const now = nowSec();
     const expiresAt = opts.expires_in_days === null
       ? null
@@ -379,6 +617,10 @@ export class LicenseService {
           activation_days: opts.activation_days,
           max_unbinds: opts.max_unbinds,
           refund_on_unbind: opts.refund_on_unbind,
+          check_mode: opts.check_mode,
+          check_frequency: opts.check_frequency,
+          check_interval_days: opts.check_interval_days,
+          check_remind_percent: opts.check_remind_percent,
           expires_at: expiresAt,
           note: opts.note,
           created_at: now,

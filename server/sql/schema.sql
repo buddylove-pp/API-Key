@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS licenses (
   max_unbinds        INTEGER     NOT NULL DEFAULT 3,     -- 可解绑次数上限
   refund_on_unbind   BOOLEAN     NOT NULL DEFAULT TRUE,  -- 解绑是否返还激活次数
 
+  -- ▼ 定期校验（两种排期方式二选一，由 check_mode 决定）
+  --   'frequency' 定频率：把 activation_days 等分成 N 段，每段到期校验一次
+  --               N = 1 → 不触发定期校验（激活那一次就算完了）
+  --               N = 10 且 activation_days = 100 → 每 10 天校验一次
+  --   'interval'  定时间：直接指定每隔多少天校验一次，与总时长无关
+  --               D = 0 → 不触发定期校验
+  check_mode           TEXT      NOT NULL DEFAULT 'frequency',
+  check_frequency      INTEGER   NOT NULL DEFAULT 1,
+  check_interval_days  INTEGER   NOT NULL DEFAULT 0,
+  -- 提前提醒比例（%）：在下次校验日之前这么多比例的时间开始提醒。0 = 不提醒
+  check_remind_percent INTEGER   NOT NULL DEFAULT 20,
+
   -- ▼ 运行时计数
   activation_count   INTEGER     NOT NULL DEFAULT 0,
   unbind_count       INTEGER     NOT NULL DEFAULT 0,
@@ -87,18 +99,59 @@ CREATE INDEX IF NOT EXISTS idx_licenses_prefix ON licenses (key_prefix);
 CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses (status);
 CREATE INDEX IF NOT EXISTS idx_licenses_product ON licenses (product);
 
--- ============ 设备绑定表 ============
+-- ============ 设备绑定 / 授权表 ============
+-- 一行 = 一台设备在一个卡密下的授权。定期校验的排期也记在这里。
 CREATE TABLE IF NOT EXISTS bindings (
-  id          BIGSERIAL PRIMARY KEY,
-  license_id  BIGINT    NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
-  device_fp   TEXT      NOT NULL,   -- 设备指纹哈希（客户端上报，只存哈希）
-  device_name TEXT,                 -- 用户可读设备名，便于自助解绑时辨认
-  first_seen  BIGINT    NOT NULL,
-  last_seen   BIGINT    NOT NULL,
+  id                     BIGSERIAL PRIMARY KEY,
+  license_id             BIGINT    NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+  device_fp              TEXT      NOT NULL,   -- 设备指纹哈希（只存哈希，不上报原始硬件信息）
+  device_name            TEXT,                 -- 用户可读设备名，便于自助解绑时辨认
+  first_seen             BIGINT    NOT NULL,   -- 首次激活时间（时间锚点，不可变）
+  last_seen              BIGINT    NOT NULL,
+
+  -- ▼ 授权期：激活时一次算定，之后不再受卡密自身有效期影响
+  entitlement_expires_at BIGINT,               -- = first_seen + activation_days
+
+  -- ▼ 定期校验排期
+  check_frequency        INTEGER   NOT NULL DEFAULT 1,
+  check_interval_days    INTEGER   NOT NULL DEFAULT 0,   -- 周期（天），0 = 不校验
+  check_remind_percent   INTEGER   NOT NULL DEFAULT 20,
+  last_check_at          BIGINT,               -- 上次校验时间（激活时 = first_seen）
+  next_check_at          BIGINT,               -- 计划下次校验；NULL = 不校验
+  check_state            TEXT      NOT NULL DEFAULT 'active',  -- active | due | overdue
+  overdue_since          BIGINT,               -- 进入超期状态的时间
+
   UNIQUE (license_id, device_fp)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bindings_license ON bindings (license_id);
+CREATE INDEX IF NOT EXISTS idx_bindings_next_check ON bindings (next_check_at);
+
+-- ============ 老库升级（幂等） ============
+-- CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，所以这里补一遍
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_mode           TEXT NOT NULL DEFAULT 'frequency';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_frequency      INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_interval_days  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_remind_percent INTEGER NOT NULL DEFAULT 20;
+
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS entitlement_expires_at BIGINT;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_frequency        INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_interval_days    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_remind_percent   INTEGER NOT NULL DEFAULT 20;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS last_check_at          BIGINT;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS next_check_at          BIGINT;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_state            TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS overdue_since          BIGINT;
+
+-- 老数据补算授权到期时间（激活时间 + 卡密授予天数）
+UPDATE bindings b
+   SET entitlement_expires_at = b.first_seen + (l.activation_days * 86400)
+  FROM licenses l
+ WHERE b.license_id = l.id
+   AND b.entitlement_expires_at IS NULL;
+
+-- 老数据补 last_check_at
+UPDATE bindings SET last_check_at = first_seen WHERE last_check_at IS NULL;
 
 -- ============ 审计日志 ============
 -- 排查纠纷必需：谁在什么时候用什么设备做了什么
