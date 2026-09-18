@@ -114,7 +114,25 @@
   .login-card .sub{color:var(--muted); font-size:12px; margin-bottom:20px}
   .login-card .field{margin-bottom:14px}
   .login-card input{width:100%}
-  .login-card button{width:100%; justify-content:center}
+  .login-card button[type=submit]{width:100%; justify-content:center}
+  .login-card #btnTokenLogin{width:100%}
+
+  /* 自带的显示/隐藏密码按钮 —— 不依赖浏览器原生那个（时有时无） */
+  .pw-wrap{position:relative; display:flex; width:100%}
+  .pw-wrap input{width:100%; padding-right:40px}
+  .pw-toggle{
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    width:28px; height:28px; padding:0; margin:0;
+    display:flex; align-items:center; justify-content:center;
+    border:none; background:transparent; cursor:pointer;
+    color:var(--muted); border-radius:4px; flex:0 0 auto;
+  }
+  .pw-toggle:hover{background:#eef0f3; color:var(--text)}
+  .pw-toggle:focus-visible{outline:2px solid rgba(45,108,223,.4)}
+  .pw-toggle svg{width:16px; height:16px; display:block}
+  .pw-toggle .eye-off{display:none}
+  .pw-toggle.on .eye-open{display:none}
+  .pw-toggle.on .eye-off{display:block}
 </style>
 </head>
 <body>
@@ -131,7 +149,19 @@
     </div>
     <div class="field">
       <label>密码</label>
-      <input id="loginPass" type="password" autocomplete="current-password" placeholder="密码">
+      <div class="pw-wrap">
+        <input id="loginPass" type="password" autocomplete="current-password" placeholder="密码">
+        <button type="button" class="pw-toggle" data-target="loginPass" title="显示密码" aria-label="显示密码">
+          <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+          <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+            <line x1="1" y1="1" x2="23" y2="23"/>
+          </svg>
+        </button>
+      </div>
     </div>
     <button type="submit" class="primary" id="btnLogin">登录</button>
     <div id="loginMsg" class="msg"></div>
@@ -140,7 +170,19 @@
       <summary class="hint" style="cursor:pointer">改用管理员令牌登录</summary>
       <div class="field" style="margin-top:10px">
         <label>令牌（ADMIN_TOKEN 或后台签发的令牌）</label>
-        <input id="loginToken" type="password" placeholder="粘贴令牌">
+        <div class="pw-wrap">
+          <input id="loginToken" type="password" placeholder="粘贴令牌">
+          <button type="button" class="pw-toggle" data-target="loginToken" title="显示令牌" aria-label="显示令牌">
+            <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+            <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+              <line x1="1" y1="1" x2="23" y2="23"/>
+            </svg>
+          </button>
+        </div>
       </div>
       <button type="button" id="btnTokenLogin" style="width:100%">用令牌登录</button>
     </details>
@@ -510,6 +552,7 @@
     $("loginScreen").hidden = false;
     $("app").hidden = true;
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    resetPasswordFields();
   }
 
   function logout(silent) {
@@ -1041,6 +1084,32 @@
   };
 
   $("btnLogout").onclick = function () { logout(false); };
+
+  // 显示/隐藏密码。不用浏览器原生那个 —— Edge/Chrome 的"眼睛"只在聚焦时出现，
+  // 点空白处再回来就没了，行为不一致。自己实现一个稳定的。
+  document.querySelectorAll(".pw-toggle").forEach(function (btn) {
+    btn.onclick = function () {
+      var input = $(btn.dataset.target);
+      if (!input) return;
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.classList.toggle("on", show);
+      btn.title = show ? "隐藏" : "显示";
+      btn.setAttribute("aria-label", btn.title);
+      input.focus();
+    };
+  });
+
+  /** 登录成功后把密码框恢复成隐藏状态，避免下次打开时明文暴露 */
+  function resetPasswordFields() {
+    document.querySelectorAll(".pw-toggle").forEach(function (btn) {
+      var input = $(btn.dataset.target);
+      if (input) input.type = "password";
+      btn.classList.remove("on");
+      btn.title = "显示";
+      btn.setAttribute("aria-label", "显示");
+    });
+  }
 
   document.querySelectorAll(".tabs button[data-tab]").forEach(function (b) {
     b.onclick = function () { switchTab(b.dataset.tab); };
