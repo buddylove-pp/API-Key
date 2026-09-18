@@ -125,10 +125,12 @@ CREATE TABLE IF NOT EXISTS bindings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bindings_license ON bindings (license_id);
-CREATE INDEX IF NOT EXISTS idx_bindings_next_check ON bindings (next_check_at);
 
 -- ============ 老库升级（幂等） ============
--- CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，所以这里补一遍
+-- ⚠️ 顺序至关重要：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+-- 所以老库上必须靠这些 ALTER 把新列加上；而任何依赖新列的语句
+-- （建索引、回填 UPDATE）都必须排在 ALTER 之后。
+-- 否则整批多语句查询会因一个报错全部回滚，迁移等于没做。
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_mode           TEXT NOT NULL DEFAULT 'frequency';
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_frequency      INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS check_interval_days  INTEGER NOT NULL DEFAULT 0;
@@ -142,6 +144,9 @@ ALTER TABLE bindings ADD COLUMN IF NOT EXISTS last_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS next_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_state            TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS overdue_since          BIGINT;
+
+-- 依赖新列的索引，必须放在 ALTER 之后
+CREATE INDEX IF NOT EXISTS idx_bindings_next_check ON bindings (next_check_at);
 
 -- 老数据补算授权到期时间（激活时间 + 卡密授予天数）
 UPDATE bindings b

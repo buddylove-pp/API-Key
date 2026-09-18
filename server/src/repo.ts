@@ -635,23 +635,54 @@ export class PgRepo implements Repo {
 
     try {
       await this.pool.query(sql);
+      return;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+
       // 托管平台的内网数据库通常不支持 SSL，而外部数据库通常强制 SSL。
       // 与其让用户猜该不该开，不如按错误自动降级重试一次。
       const sslMismatch = /does not support SSL/i.test(msg)
         || /SSL required/i.test(msg)
         || /no pg_hba.conf entry/i.test(msg);
 
-      if (!sslMismatch || this.connectionString === "") throw e;
+      if (sslMismatch && this.connectionString !== "") {
+        const retrySsl = !this.sslEnabled;
+        console.warn(`[db] 连接失败（${msg}），改用 ssl=${retrySsl} 重试`);
 
-      const retrySsl = !this.sslEnabled;
-      console.warn(`[db] 连接失败（${msg}），改用 ssl=${retrySsl} 重试`);
+        await this.pool.end().catch(() => undefined);
+        this.sslEnabled = retrySsl;
+        this.pool = this.makePool(this.connectionString, retrySsl);
+        await this.pool.query(sql);
+        return;
+      }
 
-      await this.pool.end().catch(() => undefined);
-      this.sslEnabled = retrySsl;
-      this.pool = this.makePool(this.connectionString, retrySsl);
-      await this.pool.query(sql);
+      // 其它错误：整批多语句查询在 Postgres 里是隐式事务，
+      // 一条失败会全部回滚 —— 迁移等于没做，还很难定位。
+      // 这里退化成逐条执行：单条失败只记录，其余照常生效。
+      console.warn(`[db] 整批建表失败（${msg}），改为逐条执行`);
+      await this.execStatementByStatement(sql);
+    }
+  }
+
+  /** 逐条执行 schema；单条失败不中断，最后把失败项一次性报出来 */
+  private async execStatementByStatement(sql: string): Promise<void> {
+    const statements = sql
+      .split(/;\s*(?:\r?\n|$)/)
+      .map((s) => s.trim())
+      .filter((s) => s !== "");
+
+    const failures: string[] = [];
+    for (const stmt of statements) {
+      try {
+        await this.pool.query(stmt);
+      } catch (e) {
+        const head = stmt.replace(/\s+/g, " ").slice(0, 70);
+        failures.push(`${head}… → ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(`建表有 ${failures.length} 条语句失败：\n` + failures.join("\n"));
     }
   }
 
