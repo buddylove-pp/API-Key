@@ -168,6 +168,16 @@ export interface CheckResult extends TicketInfo {
   previous_next_check_at: number | null;
 }
 
+/**
+ * 心跳结果：票据 + 当前授权状态。
+ *
+ * 带上 entitlement 是为了让「强制校验」能及时送达 ——
+ * 心跳是客户端唯一的常驻轮询点，没有它就得等到下次校验才生效。
+ */
+export interface HeartbeatResult extends TicketInfo {
+  entitlement: EntitlementInfo;
+}
+
 /** 单台设备的授权与校验状态（后台详情页用） */
 export interface DeviceDetail {
   device_fp: string;
@@ -460,7 +470,7 @@ export class LicenseService {
       ?? binding.first_seen + lic.activation_days * SECONDS_PER_DAY;
   }
 
-  async heartbeat(ticket: string, deviceFp: string, ctx: CallContext): Promise<TicketInfo> {
+  async heartbeat(ticket: string, deviceFp: string, ctx: CallContext): Promise<HeartbeatResult> {
     const now = nowSec();
     const { lic, binding } = await this.resolveSession(ticket, deviceFp, now);
 
@@ -470,7 +480,12 @@ export class LicenseService {
       ip: ctx.ip, app_version: ctx.appVersion, detail: null, created_at: now,
     });
 
-    return this.issueTicket(lic, deviceFp, now, binding);
+    // 心跳也要带回授权状态 —— 它是客户端唯一的常驻轮询点，
+    // 管理员下发的「强制校验」必须能通过它及时送达，否则要等到下次校验才生效。
+    return {
+      ...this.issueTicket(lic, deviceFp, now, binding),
+      entitlement: this.buildEntitlement(lic, binding, now),
+    };
   }
 
   /**

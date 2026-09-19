@@ -807,6 +807,10 @@ async function run() {
 
     const hb = await api("/api/v1/heartbeat", { body: { ticket, device_fp: FP_A } });
     check("心跳仍可续期（不因强制校验被拒）", hb.json?.code === 0, JSON.stringify(hb.json));
+    check("★ 心跳带回授权状态", hb.json?.data?.entitlement != null, JSON.stringify(hb.json?.data));
+    check("★ 心跳能读到 force_check（强制校验靠它送达）",
+      hb.json?.data?.entitlement?.force_check === true,
+      JSON.stringify(hb.json?.data?.entitlement));
 
     // ---- 后台设备详情 ----
     const detail = await api(`/admin/v1/licenses/${prefix}`, { method: "GET", token: ADMIN_TOKEN });
