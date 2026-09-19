@@ -125,6 +125,13 @@ CREATE TABLE IF NOT EXISTS bindings (
   check_state            TEXT      NOT NULL DEFAULT 'active',  -- active | due | overdue
   overdue_since          BIGINT,               -- 进入超期状态的时间
 
+  -- ▼ 强制校验：管理员主动命令这台设备立即校验
+  -- 客户端在心跳 / 启动查询时拿到 force_check=true，必须弹出不可跳过的校验窗。
+  -- 校验通过后自动清除。
+  force_check            BOOLEAN   NOT NULL DEFAULT FALSE,
+  force_check_at         BIGINT,
+  force_check_reason     TEXT,
+
   UNIQUE (license_id, device_fp)
 );
 
@@ -148,6 +155,9 @@ ALTER TABLE bindings ADD COLUMN IF NOT EXISTS last_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS next_check_at          BIGINT;
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS check_state            TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE bindings ADD COLUMN IF NOT EXISTS overdue_since          BIGINT;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS force_check            BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS force_check_at         BIGINT;
+ALTER TABLE bindings ADD COLUMN IF NOT EXISTS force_check_reason     TEXT;
 
 ALTER TABLE admin_tokens ADD COLUMN IF NOT EXISTS owner_username TEXT;
 

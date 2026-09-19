@@ -128,6 +128,11 @@ export interface BindingRow {
   next_check_at: number | null;
   check_state: CheckState;
   overdue_since: number | null;
+
+  /** 管理员主动命令这台设备立即校验；客户端心跳时读到就该弹窗 */
+  force_check: boolean;
+  force_check_at: number | null;
+  force_check_reason: string | null;
 }
 
 /** 可更新的排期字段 */
@@ -140,6 +145,9 @@ export interface BindingSchedulePatch {
   next_check_at?: number | null;
   check_state?: CheckState;
   overdue_since?: number | null;
+  force_check?: boolean;
+  force_check_at?: number | null;
+  force_check_reason?: string | null;
 }
 
 /** 创建绑定时的授权与排期参数 */
@@ -414,6 +422,9 @@ export class MemoryRepo implements Repo {
       next_check_at: entitlement.next_check_at,
       check_state: "active",
       overdue_since: null,
+      force_check: false,
+      force_check_at: null,
+      force_check_reason: null,
     });
   }
 
@@ -430,6 +441,9 @@ export class MemoryRepo implements Repo {
     if (patch.next_check_at !== undefined) b.next_check_at = patch.next_check_at;
     if (patch.check_state !== undefined) b.check_state = patch.check_state;
     if (patch.overdue_since !== undefined) b.overdue_since = patch.overdue_since;
+    if (patch.force_check !== undefined) b.force_check = patch.force_check;
+    if (patch.force_check_at !== undefined) b.force_check_at = patch.force_check_at;
+    if (patch.force_check_reason !== undefined) b.force_check_reason = patch.force_check_reason;
   }
 
   async deleteBinding(licenseId: number, deviceFp: string): Promise<boolean> {
@@ -854,8 +868,9 @@ export class PgRepo implements Repo {
       `INSERT INTO bindings
          (license_id, device_fp, device_name, first_seen, last_seen,
           entitlement_expires_at, check_frequency, check_interval_days, check_remind_percent,
-          last_check_at, next_check_at, check_state, overdue_since)
-       VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,'active',NULL)
+          last_check_at, next_check_at, check_state, overdue_since,
+          force_check, force_check_at, force_check_reason)
+       VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,'active',NULL,FALSE,NULL,NULL)
        ON CONFLICT (license_id, device_fp) DO UPDATE
          SET last_seen = $4,
              entitlement_expires_at = $5,
@@ -865,7 +880,10 @@ export class PgRepo implements Repo {
              last_check_at = $9,
              next_check_at = $10,
              check_state = 'active',
-             overdue_since = NULL`,
+             overdue_since = NULL,
+             force_check = FALSE,
+             force_check_at = NULL,
+             force_check_reason = NULL`,
       [
         licenseId, deviceFp, deviceName, at,
         entitlement.entitlement_expires_at,
@@ -890,6 +908,9 @@ export class PgRepo implements Repo {
       next_check_at: patch.next_check_at,
       check_state: patch.check_state,
       overdue_since: patch.overdue_since,
+      force_check: patch.force_check,
+      force_check_at: patch.force_check_at,
+      force_check_reason: patch.force_check_reason,
     };
 
     const sets: string[] = [];

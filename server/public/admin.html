@@ -106,6 +106,20 @@
   }
   .tokenbox code{display:block; word-break:break-all; margin:8px 0; font-size:13px}
 
+  /* 设备卡片（卡密详情里的每台授权设备） */
+  .devcard{
+    border:1px solid var(--line); border-radius:6px; padding:12px;
+    margin-bottom:10px; background:#fff;
+  }
+  .devcard.forced{border-color:#f0c4bf; background:#fdf8f7}
+  .devhead{display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap}
+  .devhead .grow{flex:1}
+  .devcard .kv{grid-template-columns:96px 1fr}
+  .devcard .kv dt{font-size:12px}
+  .devcard .kv dd{font-size:12px}
+  .tag.due{color:var(--warn); border-color:#f0dfae; background:#fff8e6}
+  .tag.overdue{color:var(--err); border-color:#f0c4bf; background:#fdf2f1}
+
   /* 登录屏 */
   #loginScreen{
     min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;
@@ -1091,8 +1105,11 @@
     var r = await api("/licenses/" + encodeURIComponent(prefix), { method: "GET" });
     if (r.code !== 0) { alert("查询失败：" + r.msg); return; }
 
-    var lic = r.data.license, binds = r.data.bindings || [], audit = r.data.audit || [];
+    var lic = r.data.license;
+    var devices = r.data.devices || [];
+    var audit = r.data.audit || [];
     var statusText = { unused: "未使用", active: "已激活", banned: "已封禁" };
+    var stateText = { active: "正常", due: "提醒期", overdue: "已过校验期" };
 
     var html = '<dl class="kv">' +
       "<dt>ID</dt><dd>" + lic.id + "</dd>" +
@@ -1103,40 +1120,122 @@
       "<dt>解绑</dt><dd>" + lic.unbind_count + " / " + lic.max_unbinds + "</dd>" +
       "<dt>设备上限</dt><dd>" + lic.max_devices + "</dd>" +
       "<dt>每次天数</dt><dd>" + lic.activation_days + "</dd>" +
+      "<dt>校验排期</dt><dd>" + checkPlanText(lic) + "</dd>" +
       "<dt>解绑返还</dt><dd>" + (lic.refund_on_unbind ? "是" : "否") + "</dd>" +
       "<dt>首次激活</dt><dd>" + fmtTime(lic.first_activated_at) + "</dd>" +
       "<dt>卡密到期</dt><dd>" + fmtTime(lic.expires_at) + "</dd>" +
       "<dt>备注</dt><dd>" + esc(lic.note || "—") + "</dd>" +
       "</dl>";
 
-    html += "<h3 style='font-size:13px;margin:18px 0 8px'>绑定设备（" + binds.length + "）</h3>";
-    if (!binds.length) {
-      html += '<div class="hint">暂无绑定</div>';
+    // ---- 每台设备的授权与校验状态 ----
+    html += "<h3 style='font-size:13px;margin:18px 0 8px'>授权设备（" + devices.length + "）</h3>";
+    if (!devices.length) {
+      html += '<div class="hint">暂无绑定设备</div>';
     } else {
-      html += "<table><thead><tr><th>设备指纹</th><th>名称</th><th>首次</th><th>最近</th></tr></thead><tbody>";
-      binds.forEach(function (b) {
-        html += "<tr><td class='mono'>" + esc(b.device_fp.slice(0, 16)) + "…</td><td>" +
-                esc(b.device_name || "—") + "</td><td>" + fmtTime(b.first_seen) +
-                "</td><td>" + fmtTime(b.last_seen) + "</td></tr>";
+      devices.forEach(function (d) {
+        html += '<div class="devcard' + (d.force_check ? " forced" : "") + '">';
+        html += '<div class="devhead">';
+        html += '<span class="mono">' + esc(d.device_fp.slice(0, 20)) + "…</span>";
+        html += '<span class="tag ' + esc(d.state) + '">' + stateText[d.state] + "</span>";
+        if (d.force_check) html += '<span class="tag banned">强制校验中</span>';
+        html += '<span class="grow"></span>';
+        html += d.force_check
+          ? '<button class="sm fc-clear" data-fp="' + esc(d.device_fp) + '">撤销强制</button>'
+          : '<button class="sm danger fc-set" data-fp="' + esc(d.device_fp) + '">强制校验</button>';
+        html += "</div>";
+
+        html += '<dl class="kv">';
+        html += "<dt>设备名</dt><dd>" + esc(d.device_name || "—") + "</dd>";
+        html += "<dt>授权期</dt><dd>" + fmtTime(d.first_seen) + " → " +
+                fmtTime(d.entitlement_expires_at) + "（剩余 " + d.days_left + " 天）</dd>";
+        html += "<dt>校验周期</dt><dd>" +
+                (d.check_interval_days > 0 ? "每 " + d.check_interval_days + " 天" : "不做定期校验") + "</dd>";
+        html += "<dt>上次校验</dt><dd>" + fmtTime(d.last_check_at) + "</dd>";
+        html += "<dt>下次校验</dt><dd>" + fmtTime(d.next_check_at) + "</dd>";
+        html += "<dt>提醒开始</dt><dd>" + fmtTime(d.remind_at) + "</dd>";
+        html += "<dt>最近在线</dt><dd>" + fmtTime(d.last_seen) + "</dd>";
+        if (d.force_check_reason) {
+          html += "<dt>强制原因</dt><dd>" + esc(d.force_check_reason) + "</dd>";
+        }
+        html += "</dl></div>";
       });
-      html += "</tbody></table>";
+
+      html += '<div class="row" style="margin-top:6px">' +
+              '<button class="sm danger fc-set" data-fp="">强制所有设备立即校验</button>' +
+              "</div>";
     }
 
-    html += "<h3 style='font-size:13px;margin:18px 0 8px'>审计日志（最近 " + audit.length + " 条）</h3>";
+    // ---- 审计日志 ----
+    html += "<h3 style='font-size:13px;margin:18px 0 8px'>操作记录（最近 " + audit.length + " 条）</h3>";
     if (!audit.length) {
-      html += '<div class="hint">暂无日志</div>';
+      html += '<div class="hint">暂无记录</div>';
     } else {
-      html += "<table><thead><tr><th>时间</th><th>事件</th><th>IP</th><th>版本</th><th>详情</th></tr></thead><tbody>";
+      html += "<table><thead><tr><th>时间</th><th>事件</th><th>设备指纹</th><th>IP</th><th>详情</th></tr></thead><tbody>";
       audit.forEach(function (a) {
-        html += "<tr><td>" + fmtTime(a.created_at) + "</td><td>" + esc(a.event) +
-                "</td><td class='mono'>" + esc(a.ip || "—") + "</td><td>" + esc(a.app_version || "—") +
-                "</td><td>" + esc(a.detail || "") + "</td></tr>";
+        html += "<tr><td>" + fmtTime(a.created_at) + "</td>" +
+                "<td>" + esc(EVENT_LABEL[a.event] || a.event) + "</td>" +
+                "<td class='mono'>" + (a.device_fp ? esc(a.device_fp.slice(0, 12)) + "…" : "—") + "</td>" +
+                "<td class='mono'>" + esc(a.ip || "—") + "</td>" +
+                "<td>" + esc(a.detail || "") + "</td></tr>";
       });
       html += "</tbody></table>";
     }
 
     $("detailBody").innerHTML = html;
+
+    // 事件绑定（用委托而不是内联 onclick，避免设备指纹里的引号出问题）
+    $("detailBody").querySelectorAll(".fc-set").forEach(function (b) {
+      b.onclick = function () { forceCheck(prefix, b.dataset.fp || null); };
+    });
+    $("detailBody").querySelectorAll(".fc-clear").forEach(function (b) {
+      b.onclick = function () { clearForceCheck(prefix, b.dataset.fp || null); };
+    });
+
     $("detail").showModal();
+  }
+
+  /** 卡密的校验排期描述 */
+  function checkPlanText(lic) {
+    if (lic.check_mode === "interval") {
+      return lic.check_interval_days > 0
+        ? "定时间 · 每 " + lic.check_interval_days + " 天一次"
+        : "不做定期校验";
+    }
+    if (!lic.check_frequency || lic.check_frequency <= 1) return "不做定期校验（频率 1）";
+    var n = Math.floor(lic.activation_days / lic.check_frequency);
+    return "定频率 · 每 " + lic.activation_days + " 天 ÷ " + lic.check_frequency +
+           " = " + n + " 天一次，提前 " + lic.check_remind_percent + "% 提醒";
+  }
+
+  /** 下发强制校验 */
+  async function forceCheck(prefix, deviceFp) {
+    var reason = prompt(
+      deviceFp ? "强制该设备立即校验？\n\n可填写原因（会记录在日志里）："
+               : "强制该卡密下所有设备立即校验？\n\n可填写原因（会记录在日志里）：",
+      "管理员发起",
+    );
+    if (reason === null) return;   // 用户取消
+
+    var r = await api("/licenses/" + encodeURIComponent(prefix) + "/force-check", {
+      body: { device_fp: deviceFp || undefined, reason: reason || null },
+    });
+    if (r.code !== 0) { alert("下发失败：" + r.msg); return; }
+
+    alert("已下发强制校验，影响 " + r.data.devices + " 台设备。\n\n" +
+          "客户端下次心跳或启动时会收到，并弹出不可跳过的校验窗。");
+    showDetail(prefix);
+    if (!$("secList").hidden) loadList();
+  }
+
+  /** 撤销强制校验 */
+  async function clearForceCheck(prefix, deviceFp) {
+    if (!confirm("撤销强制校验标记？")) return;
+    var r = await api("/licenses/" + encodeURIComponent(prefix) + "/force-check/clear", {
+      body: { device_fp: deviceFp || undefined },
+    });
+    if (r.code !== 0) { alert("撤销失败：" + r.msg); return; }
+    showDetail(prefix);
+    if (!$("secList").hidden) loadList();
   }
 
   // ---------- 管理员令牌 ----------
@@ -1274,6 +1373,8 @@
     "admin.password.fail": "改密失败",
     "admin.token.create": "签发令牌",
     "admin.token.revoke": "撤销令牌",
+    "admin.force_check": "下发强制校验",
+    "admin.force_check.clear": "撤销强制校验",
     "admin.bootstrap": "初始化账户",
     "activate": "卡密激活",
     "check": "定期校验",

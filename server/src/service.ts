@@ -149,6 +149,14 @@ export interface EntitlementInfo {
   state: "active" | "due" | "overdue";
   /** 是否已到必须校验的时刻（超期即强制停用） */
   must_check: boolean;
+
+  /**
+   * 管理员强制校验。
+   * 客户端心跳 / 启动查询读到 true 时必须弹出**不可跳过**的校验窗，
+   * 校验通过后服务端自动清除。
+   */
+  force_check: boolean;
+  force_check_reason: string | null;
 }
 
 /** 校验结果：票据 + 新的排期 */
@@ -158,6 +166,23 @@ export interface CheckResult extends TicketInfo {
   advanced: boolean;
   /** 上次计划校验时间，便于客户端核对 */
   previous_next_check_at: number | null;
+}
+
+/** 单台设备的授权与校验状态（后台详情页用） */
+export interface DeviceDetail {
+  device_fp: string;
+  device_name: string | null;
+  first_seen: number;
+  last_seen: number;
+  entitlement_expires_at: number;
+  days_left: number;
+  check_interval_days: number;
+  last_check_at: number;
+  next_check_at: number | null;
+  remind_at: number | null;
+  state: "active" | "due" | "overdue";
+  force_check: boolean;
+  force_check_reason: string | null;
 }
 
 export interface GenerateOptions {
@@ -263,6 +288,9 @@ export class LicenseService {
 
     const state = deriveState(now, binding.next_check_at, remindAt, entExpires);
 
+    // 管理员强制校验优先级最高：即使排期上还没到期，也必须立刻校验
+    const mustCheck = state === "overdue" || binding.force_check;
+
     return {
       activated_at: binding.first_seen,
       expires_at: entExpires,
@@ -274,8 +302,10 @@ export class LicenseService {
       last_check_at: binding.last_check_at ?? binding.first_seen,
       next_check_at: binding.next_check_at,
       remind_at: remindAt,
-      state,
-      must_check: state === "overdue",
+      state: binding.force_check ? "overdue" : state,
+      must_check: mustCheck,
+      force_check: binding.force_check,
+      force_check_reason: binding.force_check_reason,
     };
   }
 
@@ -460,6 +490,7 @@ export class LicenseService {
     }
 
     const previousNext = binding.next_check_at;
+    const wasForced = binding.force_check;
     let advanced = false;
 
     if (previousNext !== null && binding.check_interval_days > 0) {
@@ -470,6 +501,10 @@ export class LicenseService {
         next_check_at: next,
         check_state: "active",
         overdue_since: null,
+        // 校验通过，清除强制标记
+        force_check: false,
+        force_check_at: null,
+        force_check_reason: null,
       });
       advanced = true;
     } else {
@@ -478,6 +513,9 @@ export class LicenseService {
         last_check_at: now,
         check_state: "active",
         overdue_since: null,
+        force_check: false,
+        force_check_at: null,
+        force_check_reason: null,
       });
     }
 
@@ -485,9 +523,10 @@ export class LicenseService {
     await this.repo.audit({
       license_id: lic.id, event: "check", device_fp: deviceFp,
       ip: ctx.ip, app_version: ctx.appVersion,
-      detail: previousNext === null
-        ? "no-schedule"
-        : `prev=${previousNext} now=${now} advanced=${advanced}`,
+      detail: [
+        previousNext === null ? "无排期" : `原计划=${previousNext} 推进=${advanced}`,
+        wasForced ? "管理员强制" : "",
+      ].filter(Boolean).join(" "),
       created_at: now,
     });
 
@@ -507,6 +546,96 @@ export class LicenseService {
     const now = nowSec();
     const { lic, binding } = await this.resolveSession(ticket, deviceFp, now);
     return this.buildEntitlement(lic, binding, now);
+  }
+
+  /**
+   * 管理员强制校验。
+   *
+   * 客户端在心跳 / 启动查询时读到 `force_check: true`，
+   * 必须弹出**不可跳过**的校验窗。校验通过后服务端自动清除。
+   *
+   * @param deviceFp 传 null 表示对该卡密下所有设备生效
+   * @returns 受影响的设备数
+   */
+  async forceCheck(
+    lic: LicenseRow, deviceFp: string | null, reason: string | null, by: string,
+  ): Promise<number> {
+    const bindings = await this.repo.listBindings(lic.id);
+    const targets = deviceFp === null
+      ? bindings
+      : bindings.filter((b) => b.device_fp === deviceFp);
+
+    if (targets.length === 0) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const now = nowSec();
+    for (const b of targets) {
+      await this.repo.updateBindingSchedule(lic.id, b.device_fp, {
+        force_check: true,
+        force_check_at: now,
+        force_check_reason: reason,
+      });
+    }
+
+    await this.repo.audit({
+      license_id: lic.id,
+      event: "admin.force_check",
+      device_fp: deviceFp,
+      detail: `by=${by} 设备数=${targets.length}${reason ? ` 原因=${reason}` : ""}`,
+      created_at: now,
+    });
+
+    return targets.length;
+  }
+
+  /** 撤销强制校验标记（管理员误操作时用） */
+  async clearForceCheck(lic: LicenseRow, deviceFp: string | null, by: string): Promise<number> {
+    const bindings = await this.repo.listBindings(lic.id);
+    const targets = deviceFp === null
+      ? bindings
+      : bindings.filter((b) => b.device_fp === deviceFp);
+
+    const now = nowSec();
+    let n = 0;
+    for (const b of targets) {
+      if (!b.force_check) continue;
+      await this.repo.updateBindingSchedule(lic.id, b.device_fp, {
+        force_check: false,
+        force_check_at: null,
+        force_check_reason: null,
+      });
+      n++;
+    }
+
+    await this.repo.audit({
+      license_id: lic.id, event: "admin.force_check.clear",
+      device_fp: deviceFp, detail: `by=${by} 设备数=${n}`, created_at: now,
+    });
+    return n;
+  }
+
+  /** 卡密下每台设备的完整授权状态，供后台详情页展示 */
+  async deviceDetails(lic: LicenseRow): Promise<DeviceDetail[]> {
+    const now = nowSec();
+    const bindings = await this.repo.listBindings(lic.id);
+
+    return bindings.map((b) => {
+      const ent = this.buildEntitlement(lic, b, now);
+      return {
+        device_fp: b.device_fp,
+        device_name: b.device_name,
+        first_seen: b.first_seen,
+        last_seen: b.last_seen,
+        entitlement_expires_at: ent.expires_at,
+        days_left: ent.days_left,
+        check_interval_days: ent.check_interval_days,
+        last_check_at: ent.last_check_at,
+        next_check_at: ent.next_check_at,
+        remind_at: ent.remind_at,
+        state: ent.state,
+        force_check: ent.force_check,
+        force_check_reason: ent.force_check_reason,
+      };
+    });
   }
 
   // ---------- 解绑 ----------
@@ -646,6 +775,21 @@ export class LicenseService {
 
   async findByPrefix(prefix: string): Promise<LicenseRow[]> {
     return this.repo.findLicensesByPrefix(prefix);
+  }
+
+  /**
+   * 按完整卡密或唯一前缀定位。
+   * 前缀匹配到多条时抛 4001 —— 让调用方提示"请输入更长的前缀"，
+   * 而不是随便挑一条，那可能操作到别人的卡密。
+   */
+  async findByKeyOrPrefix(input: string): Promise<LicenseRow | null> {
+    const exact = await this.findByKey(input);
+    if (exact) return exact;
+
+    const candidates = await this.findByPrefix(input);
+    if (candidates.length === 1) return candidates[0]!;
+    if (candidates.length > 1) throw new ServiceError(ErrCode.INVALID_PARAM);
+    return null;
   }
 
   async list(opts: {

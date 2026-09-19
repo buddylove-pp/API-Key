@@ -76,6 +76,20 @@ async function api(path, { method = "POST", body, token } = {}) {
   return { status: res.status, json };
 }
 
+/**
+ * 取卡密前缀（与服务端 keyPrefixOf 对齐）。
+ * ⚠️ 卡密展示时带连字符，但入库前缀是**去掉连字符**的规范化形式，
+ *    直接 key.slice(0,8) 会带上 '-' 而匹配不到。
+ */
+function prefixOf(key) {
+  return String(key)
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "")
+    .replace(/[IL]/g, "1")
+    .replace(/O/g, "0")
+    .slice(0, 8);
+}
+
 /** 激活请求：自动带上软件标识，避免每处重复写 */
 function activate(body) {
   return api("/api/v1/activate", { body: { product: PRODUCT, ...body } });
@@ -753,6 +767,83 @@ async function run() {
 
     const staticStill = await api("/admin/v1/licenses", { method: "GET", token: ADMIN_TOKEN });
     check("静态 ADMIN_TOKEN 不受改密码影响（应急通道）", staticStill.json?.code === 0);
+  }
+
+  section("19. 强制校验与设备详情");
+  {
+    const g = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: {
+        product: PRODUCT, count: 1, max_devices: 1, max_activations: 1,
+        activation_days: 100, check_mode: "frequency", check_frequency: 10,
+        check_remind_percent: 20, note: "强制校验测试",
+      },
+    });
+    const key = g.json?.data?.keys?.[0];
+    const prefix = prefixOf(key);
+    check("前缀已规范化（不含连字符）", !prefix.includes("-") && prefix.length === 8, prefix);
+
+    const a = await activate({ license_key: key, device_fp: FP_A });
+    check("激活成功", a.json?.code === 0, JSON.stringify(a.json));
+    const ticket = a.json?.data?.ticket;
+
+    let ent = (await api("/api/v1/entitlement", { body: { ticket, device_fp: FP_A } })).json?.data;
+    check("初始 force_check=false", ent?.force_check === false, JSON.stringify(ent));
+    check("初始状态不是 overdue", ent?.state !== "overdue", ent?.state);
+
+    // ---- 管理员下发强制校验 ----
+    const fc = await api(`/admin/v1/licenses/${prefix}/force-check`, {
+      token: ADMIN_TOKEN, body: { reason: "疑似异常使用" },
+    });
+    check("下发强制校验成功", fc.json?.code === 0, JSON.stringify(fc.json));
+    check("影响 1 台设备", fc.json?.data?.devices === 1, JSON.stringify(fc.json?.data));
+
+    // ---- 客户端读到 ----
+    ent = (await api("/api/v1/entitlement", { body: { ticket, device_fp: FP_A } })).json?.data;
+    check("★ 客户端读到 force_check=true", ent?.force_check === true, JSON.stringify(ent));
+    check("★ 状态变为 overdue（强制停用）", ent?.state === "overdue", ent?.state);
+    check("must_check 为 true", ent?.must_check === true);
+    check("带回了强制原因", ent?.force_check_reason === "疑似异常使用", ent?.force_check_reason);
+
+    const hb = await api("/api/v1/heartbeat", { body: { ticket, device_fp: FP_A } });
+    check("心跳仍可续期（不因强制校验被拒）", hb.json?.code === 0, JSON.stringify(hb.json));
+
+    // ---- 后台设备详情 ----
+    const detail = await api(`/admin/v1/licenses/${prefix}`, { method: "GET", token: ADMIN_TOKEN });
+    check("详情返回设备列表", Array.isArray(detail.json?.data?.devices), JSON.stringify(detail.json?.data));
+    const dev = (detail.json?.data?.devices ?? [])[0];
+    check("设备详情含下次校验时间", dev?.next_check_at != null, JSON.stringify(dev));
+    check("设备详情含强制校验标记", dev?.force_check === true, JSON.stringify(dev));
+    check("设备详情含剩余天数", typeof dev?.days_left === "number", JSON.stringify(dev));
+    check("设备详情含提醒时间", dev?.remind_at != null, JSON.stringify(dev));
+    check("设备详情含状态", typeof dev?.state === "string", JSON.stringify(dev));
+
+    // ---- 校验后自动清除 ----
+    const c = await api("/api/v1/check", { body: { ticket, device_fp: FP_A } });
+    check("校验成功", c.json?.code === 0, JSON.stringify(c.json));
+    check("★ 校验后 force_check 自动清除",
+      c.json?.data?.entitlement?.force_check === false,
+      JSON.stringify(c.json?.data?.entitlement));
+    check("状态回到正常", c.json?.data?.entitlement?.state !== "overdue",
+      c.json?.data?.entitlement?.state);
+
+    // ---- 撤销接口 ----
+    await api(`/admin/v1/licenses/${prefix}/force-check`, { token: ADMIN_TOKEN, body: {} });
+    const cl = await api(`/admin/v1/licenses/${prefix}/force-check/clear`, {
+      token: ADMIN_TOKEN, body: {},
+    });
+    check("可撤销强制校验", cl.json?.code === 0, JSON.stringify(cl.json));
+    check("撤销了 1 台", cl.json?.data?.cleared === 1, JSON.stringify(cl.json?.data));
+
+    // ---- 审计 ----
+    const au = await api("/admin/v1/audit?event=admin.force_check", {
+      method: "GET", token: ADMIN_TOKEN,
+    });
+    check("强制校验被记入日志", (au.json?.data?.total ?? 0) >= 1, JSON.stringify(au.json?.data));
+
+    const au2 = await api("/admin/v1/audit?event=check", { method: "GET", token: ADMIN_TOKEN });
+    const forced = (au2.json?.data?.rows ?? []).some((r) => String(r.detail || "").includes("管理员强制"));
+    check("强制校验的 check 日志有标记", forced, JSON.stringify((au2.json?.data?.rows ?? []).slice(0, 3)));
   }
 
   // ============ 汇总 ============

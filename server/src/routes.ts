@@ -495,8 +495,53 @@ export function buildRouter(deps: RouterDeps): Router {
     if (!lic) throw new ServiceError(ErrCode.LICENSE_NOT_FOUND);
 
     const bindings = await service.bindingsOf(lic);
-    const audit = await service.auditOf(lic, 50);
-    ok(res, { license: lic, bindings, audit });
+    // 每台设备的授权期 / 校验排期 / 下次校验时间 / 强制校验状态
+    const devices = await service.deviceDetails(lic);
+    const audit = await service.auditOf(lic, 100);
+
+    ok(res, { license: lic, bindings, devices, audit });
+  }));
+
+  // ============ 强制校验 ============
+
+  /**
+   * 命令客户端立即校验。
+   * 客户端下次心跳 / 启动查询会读到 force_check=true，必须弹不可跳过的校验窗。
+   * 不传 device_fp 表示对该卡密下所有设备生效。
+   */
+  admin.post("/licenses/:key/force-check", requireAuth("operator"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const lic = await service.findByKeyOrPrefix(String(req.params.key));
+    if (!lic) throw new ServiceError(ErrCode.LICENSE_NOT_FOUND);
+
+    // ⚠️ str() 返回 null 而不是 undefined，判断要用 !== null
+    const deviceFp = str(body["device_fp"]);
+    if (deviceFp !== null && !isValidDeviceFp(deviceFp)) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+
+    const identity = (req as AuthedRequest).admin!;
+    const n = await service.forceCheck(lic, deviceFp, str(body["reason"]), identity.name);
+
+    ok(res, { license_id: lic.id, device_fp: deviceFp ?? null, devices: n });
+  }));
+
+  /** 撤销强制校验标记 */
+  admin.post("/licenses/:key/force-check/clear", requireAuth("operator"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const lic = await service.findByKeyOrPrefix(String(req.params.key));
+    if (!lic) throw new ServiceError(ErrCode.LICENSE_NOT_FOUND);
+
+    // ⚠️ str() 返回 null 而不是 undefined，判断要用 !== null
+    const deviceFp = str(body["device_fp"]);
+    if (deviceFp !== null && !isValidDeviceFp(deviceFp)) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+
+    const identity = (req as AuthedRequest).admin!;
+    const n = await service.clearForceCheck(lic, deviceFp, identity.name);
+
+    ok(res, { license_id: lic.id, cleared: n });
   }));
 
   /** 封禁 */
