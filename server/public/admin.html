@@ -697,14 +697,19 @@
     window.scrollTo(0, 0);
 
     var me = state.me;
-    $("roleBadge").textContent = me.role_label || me.role;
+    var isAccount = me.source === "account";
+
+    // 账户登录是最高的第 4 级 —— 唯一能签发令牌的身份。
+    // 令牌登录最高只到「管理」，且拿不到签发令牌的能力，所以标签要区分开，
+    // 否则用户会以为手里的 root 令牌和账户一样能签发令牌。
+    $("roleBadge").textContent = isAccount ? "最高管理员" : (me.role_label || me.role);
     $("roleBadge").className = "tag " + me.role;
 
-    // 令牌登录时说明为什么看不到令牌管理，避免用户以为是界面坏了
-    var suffix = "";
-    if (me.source === "token") suffix = "（令牌登录 · 无法管理令牌）";
-    else if (me.source === "static") suffix = "（静态令牌登录 · 无法管理令牌）";
-    $("whoami").textContent = me.name + " · " + (me.role_desc || "") + suffix;
+    var desc = isAccount
+      ? "账户登录 · 唯一可签发与撤销令牌的身份"
+      : (me.role_desc || "");
+    var suffix = isAccount ? "" : "（令牌登录 · 无法管理令牌）";
+    $("whoami").textContent = me.name + " · " + desc + suffix;
 
     // 只有「账户密码登录」能管理令牌 —— 令牌不能派生令牌。
     // 用令牌登录时这个页签直接不显示，避免误以为可以签发。
@@ -1252,7 +1257,7 @@
 
   // ---------- 管理员令牌 ----------
 
-  var ROLE_LABEL = { root: "最高权限", operator: "运营", readonly: "只读" };
+  var ROLE_LABEL = { root: "管理", operator: "运营", readonly: "只读" };
 
   function tokenState(t) {
     if (t.revoked) return { text: "已撤销", cls: "disabled" };
@@ -1679,11 +1684,17 @@
   // ---------- 初始化 ----------
 
   (async function init() {
-    // 角色下拉与说明
+    // 角色下拉与说明。
+    // ⚠️ 这里是**可下发的 3 个等级**，不包含能签发令牌的账户会话 ——
+    //    令牌一律不能签发令牌，否则一次泄露就能无限复制权限。
+    //    划分依据是「操作可不可逆」：
+    //      只读 → 看
+    //      运营 → 只做可逆的日常操作（发卡、解绑、催校验）
+    //      管理 → 才允许破坏性操作（封禁用户、增删改软件）
     var roles = [
-      { value: "readonly", label: "只读", desc: "只能查看卡密与软件列表，不能做任何修改" },
-      { value: "operator", label: "运营", desc: "可生成卡密、封禁、解绑、管理软件，但不能签发令牌" },
-      { value: "root", label: "最高权限", desc: "全部权限，可签发与撤销管理员令牌" },
+      { value: "readonly", label: "只读", desc: "只能查看卡密、软件、日志与统计，不能做任何修改" },
+      { value: "operator", label: "运营", desc: "可生成卡密、解绑设备、下发强制校验；不能封禁用户，也不能增删改软件" },
+      { value: "root", label: "管理", desc: "运营的全部权限，另可封禁/解封卡密、增删改软件；但仍不能签发令牌" },
     ];
     var sel = $("tRole");
     roles.forEach(function (r) {
@@ -1694,9 +1705,10 @@
     });
     sel.value = "operator";
     $("tokenRoleHint").innerHTML =
-      "只读 = 只能看；运营 = 可发卡但不能签发令牌；最高权限 = 全部。<br>" +
-      "<strong>只有账户密码登录能签发令牌</strong> —— 令牌不能派生令牌，" +
-      "防止一次泄露后权限被无限复制。默认有效期 30 分钟。";
+      "<strong>令牌一律不能签发令牌</strong> —— 只有账户密码登录能签发，" +
+      "防止一次泄露后权限被无限复制。<br>" +
+      "所以最高一级令牌叫「管理」而不是「最高权限」—— 它拿不到签发令牌的能力。" +
+      "默认有效期 30 分钟。";
 
     var saved = localStorage.getItem("licenseAdminToken");
     if (saved) {

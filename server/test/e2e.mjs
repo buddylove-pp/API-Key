@@ -564,6 +564,60 @@ async function run() {
     check("账户会话的 source 为 account", meSession.json?.data?.source === "account");
     check("root 令牌的 source 为 token", meRootTok.json?.data?.source === "token");
 
+    // ---- 三级令牌的权限边界 ----
+    // 划分依据「操作可不可逆」：
+    //   只读 → 看  运营 → 只做可逆操作  管理 → 才允许破坏性操作
+    const opTok = await api("/admin/v1/tokens", {
+      token: session, body: { role: "operator", name: "运营令牌", ttl_seconds: 1800 },
+    });
+    const opToken = opTok.json?.data?.token;
+    check("可签发运营令牌", typeof opToken === "string", JSON.stringify(opTok.json));
+
+    const opGen = await api("/admin/v1/licenses/generate", {
+      token: opToken, body: { product: PRODUCT, count: 1 },
+    });
+    check("运营令牌可发卡（可逆操作）", opGen.json?.code === 0, JSON.stringify(opGen.json));
+
+    const opBan = await api("/admin/v1/licenses/ban", {
+      token: opToken, body: { license_key: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" },
+    });
+    check("★ 运营令牌不能封禁卡密（403）", opBan.status === 403, `HTTP ${opBan.status}`);
+
+    const opProd = await api("/admin/v1/products", {
+      token: opToken, body: { code: "op-test", name: "运营测试" },
+    });
+    check("★ 运营令牌不能新增软件（403）", opProd.status === 403, `HTTP ${opProd.status}`);
+
+    const roBan = await api("/admin/v1/licenses/ban", {
+      token: roToken, body: { license_key: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" },
+    });
+    check("★ 只读令牌不能封禁（403）", roBan.status === 403, `HTTP ${roBan.status}`);
+
+    const rootBan = await api("/admin/v1/licenses/ban", {
+      token: rootToken, body: { license_key: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" },
+    });
+    check("★ 管理令牌可封禁（403 之外的错误说明权限通过了）",
+      rootBan.status !== 403, `HTTP ${rootBan.status} ${JSON.stringify(rootBan.json)}`);
+
+    const rootProd = await api("/admin/v1/products", {
+      token: rootToken, body: { code: "root-perm-test", name: "管理权限测试" },
+    });
+    check("★ 管理令牌可新增软件", rootProd.json?.code === 0, JSON.stringify(rootProd.json));
+
+    // ---- 角色标签必须准确，不能让人误以为令牌能签发令牌 ----
+    const meOp = await rawGet("/api/v1/admin/me", opToken);
+    check("运营令牌标签为「运营」", meOp.json?.data?.role_label === "运营",
+      JSON.stringify(meOp.json?.data));
+
+    check("★ 管理令牌标签为「管理」而非「最高权限」",
+      meRootTok.json?.data?.role_label === "管理", meRootTok.json?.data?.role_label);
+    check("★ 管理令牌描述明确说明不能签发令牌",
+      String(meRootTok.json?.data?.role_desc || "").includes("不能签发令牌"),
+      meRootTok.json?.data?.role_desc);
+    check("运营令牌描述说明不能封禁",
+      String(meOp.json?.data?.role_desc || "").includes("不能封禁"),
+      meOp.json?.data?.role_desc);
+
     // ---- 操作日志 ----
 
     const audit = await api("/admin/v1/audit?page=1&page_size=100", { method: "GET", token: session });

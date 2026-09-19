@@ -394,7 +394,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 手动新增软件 */
-  admin.post("/products", requireAuth("operator"), wrap(async (req, res) => {
+  admin.post("/products", requireAuth("root"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const code = str(body["code"]);
     if (!code) throw new ServiceError(ErrCode.INVALID_PARAM);
@@ -403,7 +403,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 改名 / 改备注 */
-  admin.patch("/products/:code", requireAuth("operator"), wrap(async (req, res) => {
+  admin.patch("/products/:code", requireAuth("root"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const patch: { name?: string; note?: string | null } = {};
     const name = str(body["name"]);
@@ -414,7 +414,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 启用 / 停用 / 确认待审 */
-  admin.post("/products/:code/status", requireAuth("operator"), wrap(async (req, res) => {
+  admin.post("/products/:code/status", requireAuth("root"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const s = str(body["status"]);
     if (s !== "active" && s !== "pending" && s !== "disabled") {
@@ -425,7 +425,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 删除（已有卡密的软件不允许删） */
-  admin.delete("/products/:code", requireAuth("operator"), wrap(async (req, res) => {
+  admin.delete("/products/:code", requireAuth("root"), wrap(async (req, res) => {
     await service.deleteProduct(String(req.params.code));
     ok(res, { code: req.params.code, deleted: true });
   }));
@@ -545,7 +545,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 封禁 */
-  admin.post("/licenses/ban", requireAuth("operator"), wrap(async (req, res) => {
+  admin.post("/licenses/ban", requireAuth("root"), wrap(async (req, res) => {
     const key = str(((req.body ?? {}) as Record<string, unknown>)["license_key"]);
     if (!key) throw new ServiceError(ErrCode.INVALID_PARAM);
     const lic = await service.findByKey(key);
@@ -555,7 +555,7 @@ export function buildRouter(deps: RouterDeps): Router {
   }));
 
   /** 解封 */
-  admin.post("/licenses/unban", requireAuth("operator"), wrap(async (req, res) => {
+  admin.post("/licenses/unban", requireAuth("root"), wrap(async (req, res) => {
     const key = str(((req.body ?? {}) as Record<string, unknown>)["license_key"]);
     if (!key) throw new ServiceError(ErrCode.INVALID_PARAM);
     const lic = await service.findByKey(key);

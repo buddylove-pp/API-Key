@@ -18,16 +18,35 @@ export const ROLE_RANK: Record<AdminRole, number> = {
   root: 3,
 };
 
+/**
+ * 权限等级。
+ *
+ * ⚠️ 这里有 4 个层级，但只有 3 个能被令牌承载：
+ *
+ *   第 4 级  账户密码登录的会话 —— 唯一能签发/撤销令牌的身份
+ *   第 3 级  管理令牌   root
+ *   第 2 级  运营令牌   operator
+ *   第 1 级  只读令牌   readonly
+ *
+ * 令牌一律**不能签发令牌**（否则一次泄露就能无限复制权限）。
+ * 所以最高一级令牌也只能叫「管理」，不能叫「最高权限」——
+ * 那会让人误以为它能签发令牌。
+ *
+ * 三级的划分依据是「操作可不可逆」：
+ *   只读 → 看
+ *   运营 → 只做可逆的日常操作（发卡、解绑、催校验）
+ *   管理 → 才允许做破坏性操作（封禁用户、增删改软件）
+ */
 export const ROLE_LABEL: Record<AdminRole, string> = {
   readonly: "只读",
   operator: "运营",
-  root: "最高权限",
+  root: "管理",
 };
 
 export const ROLE_DESC: Record<AdminRole, string> = {
-  readonly: "只能查看卡密与软件列表，不能做任何修改",
-  operator: "可生成卡密、封禁、解绑、管理软件，但不能签发令牌",
-  root: "全部权限，可签发与撤销管理员令牌",
+  readonly: "只能查看卡密、软件、日志与统计，不能做任何修改",
+  operator: "可生成卡密、解绑设备、下发强制校验；不能封禁用户，也不能增删改软件",
+  root: "运营的全部权限，另可封禁/解封卡密、增删改软件；但仍不能签发令牌",
 };
 
 export function isAdminRole(v: unknown): v is AdminRole {
