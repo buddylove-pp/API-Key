@@ -1137,7 +1137,13 @@
         html += '<div class="devhead">';
         html += '<span class="mono">' + esc(d.device_fp.slice(0, 20)) + "…</span>";
         html += '<span class="tag ' + esc(d.state) + '">' + stateText[d.state] + "</span>";
-        if (d.force_check) html += '<span class="tag banned">强制校验中</span>';
+        if (d.force_check) {
+          html += '<span class="tag banned">强制校验中</span>';
+          // 客户端不在线时不会立即弹窗，要等下次联网才拿到
+          html += '<span class="tag pending">待客户端联网</span>';
+        } else if (d.force_check_at) {
+          html += '<span class="tag active">强制校验已完成</span>';
+        }
         html += '<span class="grow"></span>';
         html += d.force_check
           ? '<button class="sm fc-clear" data-fp="' + esc(d.device_fp) + '">撤销强制</button>'
@@ -1154,8 +1160,12 @@
         html += "<dt>下次校验</dt><dd>" + fmtTime(d.next_check_at) + "</dd>";
         html += "<dt>提醒开始</dt><dd>" + fmtTime(d.remind_at) + "</dd>";
         html += "<dt>最近在线</dt><dd>" + fmtTime(d.last_seen) + "</dd>";
-        if (d.force_check_reason) {
-          html += "<dt>强制原因</dt><dd>" + esc(d.force_check_reason) + "</dd>";
+        if (d.force_check_at) {
+          html += "<dt>强制下发</dt><dd>" + fmtTime(d.force_check_at) +
+                  (d.force_check_reason ? " · " + esc(d.force_check_reason) : "") +
+                  (d.force_check_delivered
+                    ? "　<span class='tag active'>已响应</span>"
+                    : "　<span class='tag pending'>等待响应</span>") + "</dd>";
         }
         html += "</dl></div>";
       });
@@ -1222,7 +1232,9 @@
     if (r.code !== 0) { alert("下发失败：" + r.msg); return; }
 
     alert("已下发强制校验，影响 " + r.data.devices + " 台设备。\n\n" +
-          "客户端下次心跳或启动时会收到，并弹出不可跳过的校验窗。");
+          "客户端不在线时不会立即弹窗 —— 它在下次联网（心跳或启动）时收到，\n" +
+          "之后必须完成校验才能继续使用。\n\n" +
+          "设备卡片上会显示「待客户端联网」或「已响应」。");
     showDetail(prefix);
     if (!$("secList").hidden) loadList();
   }

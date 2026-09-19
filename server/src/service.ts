@@ -192,7 +192,16 @@ export interface DeviceDetail {
   remind_at: number | null;
   state: "active" | "due" | "overdue";
   force_check: boolean;
+  force_check_at: number | null;
   force_check_reason: string | null;
+  /**
+   * 强制校验是否已被客户端响应。
+   *
+   * 判定：下发之后有过一次校验。
+   * 客户端不在线时不会立即弹窗 —— 它在下次联网（心跳 / 启动查询）时才拿到，
+   * 所以这里能看出「已下发但还没送达」和「已响应」的区别。
+   */
+  force_check_delivered: boolean;
 }
 
 export interface GenerateOptions {
@@ -516,10 +525,9 @@ export class LicenseService {
         next_check_at: next,
         check_state: "active",
         overdue_since: null,
-        // 校验通过，清除强制标记
+        // 只清「待校验」标记，force_check_at / reason 保留下来当历史记录 ——
+        // 后台要靠它显示「上次强制下发时间 + 是否已响应」
         force_check: false,
-        force_check_at: null,
-        force_check_reason: null,
       });
       advanced = true;
     } else {
@@ -529,8 +537,6 @@ export class LicenseService {
         check_state: "active",
         overdue_since: null,
         force_check: false,
-        force_check_at: null,
-        force_check_reason: null,
       });
     }
 
@@ -635,6 +641,8 @@ export class LicenseService {
 
     return bindings.map((b) => {
       const ent = this.buildEntitlement(lic, b, now);
+      const lastCheck = b.last_check_at ?? 0;
+
       return {
         device_fp: b.device_fp,
         device_name: b.device_name,
@@ -648,7 +656,11 @@ export class LicenseService {
         remind_at: ent.remind_at,
         state: ent.state,
         force_check: ent.force_check,
+        force_check_at: b.force_check_at,
         force_check_reason: ent.force_check_reason,
+        // 下发之后有过一次校验，说明客户端已经收到并完成了
+        force_check_delivered:
+          b.force_check_at !== null && lastCheck > b.force_check_at,
       };
     });
   }

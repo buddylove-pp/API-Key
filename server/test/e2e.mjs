@@ -818,11 +818,17 @@ async function run() {
     const dev = (detail.json?.data?.devices ?? [])[0];
     check("设备详情含下次校验时间", dev?.next_check_at != null, JSON.stringify(dev));
     check("设备详情含强制校验标记", dev?.force_check === true, JSON.stringify(dev));
+    check("★ 下发后标记为等待响应", dev?.force_check_delivered === false, JSON.stringify(dev));
+    check("设备详情含下发时间", dev?.force_check_at != null, JSON.stringify(dev));
     check("设备详情含剩余天数", typeof dev?.days_left === "number", JSON.stringify(dev));
     check("设备详情含提醒时间", dev?.remind_at != null, JSON.stringify(dev));
     check("设备详情含状态", typeof dev?.state === "string", JSON.stringify(dev));
 
     // ---- 校验后自动清除 ----
+    // 等 1 秒：下发与校验发生在同一秒时，无法用秒级时间戳区分先后，
+    // 而「已响应」的判定刻意用严格大于（宁可显示"等待"也不误报"已响应"）
+    await new Promise((r) => setTimeout(r, 1100));
+
     const c = await api("/api/v1/check", { body: { ticket, device_fp: FP_A } });
     check("校验成功", c.json?.code === 0, JSON.stringify(c.json));
     check("★ 校验后 force_check 自动清除",
@@ -830,6 +836,13 @@ async function run() {
       JSON.stringify(c.json?.data?.entitlement));
     check("状态回到正常", c.json?.data?.entitlement?.state !== "overdue",
       c.json?.data?.entitlement?.state);
+
+    // 校验后保留下发记录，后台才能显示「上次强制下发 + 已响应」
+    const d3 = await api(`/admin/v1/licenses/${prefix}`, { method: "GET", token: ADMIN_TOKEN });
+    const dev3 = (d3.json?.data?.devices ?? [])[0];
+    check("★ 校验后保留下发记录并标记已响应",
+      dev3?.force_check === false && dev3?.force_check_at != null && dev3?.force_check_delivered === true,
+      JSON.stringify(dev3));
 
     // ---- 撤销接口 ----
     await api(`/admin/v1/licenses/${prefix}/force-check`, { token: ADMIN_TOKEN, body: {} });
