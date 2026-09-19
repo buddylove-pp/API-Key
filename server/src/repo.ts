@@ -203,8 +203,22 @@ export interface ListOptions {
   status?: LicenseStatus | undefined;
   product?: string | undefined;
   q?: string | undefined;
+  /** 隐藏卡密自身已过期的（expires_at 非空且已过） */
+  hideExpired?: boolean | undefined;
   page: number;
   pageSize: number;
+}
+
+/**
+ * 卡密自身是否已过期。
+ * `expires_at` 为 NULL 表示不限制有效期（永久有效），不算过期。
+ *
+ * ⚠️ 这与「授权到期」不是一回事：
+ *    授权到期是绑定设备的 entitlement_expires_at，激活那一刻才确定；
+ *    这里说的是卡密本身还没用就作废了。
+ */
+export function isLicenseExpired(row: LicenseRow, now: number): boolean {
+  return row.expires_at !== null && row.expires_at <= now;
 }
 
 export interface Repo {
@@ -217,6 +231,16 @@ export interface Repo {
   findLicensesByPrefix(prefix: string): Promise<LicenseRow[]>;
   listLicenses(opts: ListOptions): Promise<{ rows: LicenseRow[]; total: number }>;
   setLicenseStatus(id: number, status: LicenseStatus): Promise<void>;
+
+  /**
+   * 彻底删除卡密，并连带删除它的设备绑定。
+   *
+   * ⚠️ 审计日志**不删** —— 那是历史记录，删掉就查不到"这张卡密曾经做过什么"了。
+   *    audit_log.license_id 只是普通字段，没有外键，所以不会级联。
+   *
+   * @returns 连带删除的绑定条数
+   */
+  deleteLicense(id: number): Promise<number>;
 
   incrementActivation(id: number, at: number): Promise<void>;
   decrementActivation(id: number): Promise<void>;
@@ -361,6 +385,10 @@ export class MemoryRepo implements Repo {
     let all = [...this.licenses.values()].sort((a, b) => b.id - a.id);
     if (opts.status) all = all.filter((r) => r.status === opts.status);
     if (opts.product) all = all.filter((r) => r.product === opts.product);
+    if (opts.hideExpired) {
+      const now = Math.floor(Date.now() / 1000);
+      all = all.filter((r) => !isLicenseExpired(r, now));
+    }
     if (opts.q) {
       const q = opts.q.toUpperCase();
       all = all.filter((r) => r.key_prefix.includes(q) || (r.note ?? "").toUpperCase().includes(q));
@@ -373,6 +401,16 @@ export class MemoryRepo implements Repo {
   async setLicenseStatus(id: number, status: LicenseStatus): Promise<void> {
     const row = this.licenses.get(id);
     if (row) row.status = status;
+  }
+
+  async deleteLicense(id: number): Promise<number> {
+    // 先删绑定再删卡密，避免留下孤儿绑定
+    const before = this.bindings.length;
+    this.bindings = this.bindings.filter((b) => b.license_id !== id);
+    const removed = before - this.bindings.length;
+
+    this.licenses.delete(id);
+    return removed;
   }
 
   async incrementActivation(id: number, at: number): Promise<void> {
@@ -800,6 +838,11 @@ export class PgRepo implements Repo {
       params.push(`%${opts.q.toUpperCase()}%`);
       where.push(`(key_prefix LIKE $${params.length} OR UPPER(COALESCE(note,'')) LIKE $${params.length})`);
     }
+    if (opts.hideExpired) {
+      // expires_at 为 NULL 表示永久有效，不该被"隐藏过期"过滤掉
+      params.push(Math.floor(Date.now() / 1000));
+      where.push(`(expires_at IS NULL OR expires_at > $${params.length})`);
+    }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
     const countRes = await this.pool.query<{ n: number }>(
@@ -819,6 +862,14 @@ export class PgRepo implements Repo {
 
   async setLicenseStatus(id: number, status: LicenseStatus): Promise<void> {
     await this.pool.query(`UPDATE licenses SET status = $2 WHERE id = $1`, [id, status]);
+  }
+
+  async deleteLicense(id: number): Promise<number> {
+    // 绑定的排期数据是卡密的附属信息，删卡密时必须一起清掉；
+    // 审计日志保留（无外键，不会被级联）
+    const del = await this.pool.query(`DELETE FROM bindings WHERE license_id = $1`, [id]);
+    await this.pool.query(`DELETE FROM licenses WHERE id = $1`, [id]);
+    return del.rowCount ?? 0;
   }
 
   async incrementActivation(id: number, at: number): Promise<void> {

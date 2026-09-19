@@ -515,10 +515,39 @@ export function buildRouter(deps: RouterDeps): Router {
       status,
       product: str(req.query["product"]) ?? undefined,
       q: str(req.query["q"]) ?? undefined,
+      hideExpired: str(req.query["hide_expired"]) === "1",
       page,
       pageSize,
     });
     ok(res, { ...result, page, page_size: pageSize });
+  }));
+
+  /**
+   * 批量删除卡密（彻底删除，不可恢复）。
+   *
+   * 需要 root 权限 —— 这是不可逆的破坏性操作。
+   * 支持传完整卡密或唯一前缀；前缀歧义的会被跳过并列在 notFound 里，不猜。
+   */
+  admin.post("/licenses/delete", requireAuth("root"), wrap(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const raw = body["keys"];
+
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (raw.length > 200) {
+      fail(res, 4001, "一次最多删除 200 张", 400);
+      return;
+    }
+
+    const keys = raw.filter((k): k is string => typeof k === "string");
+    if (keys.length === 0) throw new ServiceError(ErrCode.INVALID_PARAM);
+
+    const identity = (req as AuthedRequest).admin!;
+    const result = await service.deleteLicenses(
+      keys, identity.name, { ip: clientIp(req), appVersion: str(body["app_version"]) },
+    );
+    ok(res, result);
   }));
 
   /** 单卡详情：支持完整卡密或前缀 */

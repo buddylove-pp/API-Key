@@ -823,10 +823,64 @@ export class LicenseService {
     status?: "unused" | "active" | "banned";
     product?: string;
     q?: string;
+    hideExpired?: boolean;
     page: number;
     pageSize: number;
   }) {
     return this.repo.listLicenses(opts);
+  }
+
+  /**
+   * 批量删除卡密。
+   *
+   * 每张卡密都先写审计日志再删 —— 顺序不能反，
+   * 反了就只能记下"删了某张卡密"而不知道它当时是什么状态。
+   *
+   * 审计日志本身不删：那是历史记录，删掉就查不到
+   * "这张卡密曾经被谁激活过、什么时候被封过"了。
+   */
+  async deleteLicenses(
+    inputs: string[], by: string, ctx: CallContext,
+  ): Promise<{ deleted: number; notFound: string[]; bindings: number }> {
+    const now = nowSec();
+    const notFound: string[] = [];
+    let deleted = 0;
+    let bindings = 0;
+
+    for (const input of inputs) {
+      const key = input.trim();
+      if (key === "") continue;
+
+      let lic: LicenseRow | null = null;
+      try {
+        lic = await this.findByKeyOrPrefix(key);
+      } catch {
+        // 前缀歧义：不猜，记下来让用户自己澄清
+        notFound.push(key);
+        continue;
+      }
+
+      if (!lic) {
+        notFound.push(key);
+        continue;
+      }
+
+      // 先留痕再删
+      await this.repo.audit({
+        license_id: lic.id,
+        event: "admin.license.delete",
+        ip: ctx.ip,
+        app_version: ctx.appVersion,
+        detail: `by=${by} prefix=${lic.key_prefix} product=${lic.product} ` +
+                `status=${lic.status} 激活=${lic.activation_count}/${lic.max_activations}`,
+        created_at: now,
+      });
+
+      bindings += await this.repo.deleteLicense(lic.id);
+      deleted++;
+    }
+
+    return { deleted, notFound, bindings };
   }
 
   async setStatus(lic: LicenseRow, status: "unused" | "active" | "banned", ctx: CallContext): Promise<void> {

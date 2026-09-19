@@ -339,6 +339,10 @@
           </div>
           <button id="btnSearch" class="primary">查询</button>
           <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:4px">
+            <input id="hideExpired" type="checkbox" style="width:auto">
+            隐藏已过期
+          </label>
+          <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:4px">
             <input id="autoRefresh" type="checkbox" style="width:auto">
             自动刷新
           </label>
@@ -351,10 +355,20 @@
         </div>
 
         <div id="listMsg" class="msg"></div>
-        <div style="overflow:auto; margin-top:12px">
+
+        <div class="row" style="margin-top:12px">
+          <button id="btnDeleteSelected" class="sm danger" disabled>删除选中</button>
+          <span id="selCount" class="hint">未选中</span>
+          <span class="hint" style="margin-left:auto">
+            删除不可恢复，但操作记录会保留在「操作日志」里
+          </span>
+        </div>
+
+        <div style="overflow:auto; margin-top:8px">
           <table>
             <thead>
               <tr>
+                <th style="width:34px"><input type="checkbox" id="listAll" style="width:auto"></th>
                 <th>ID</th><th>前缀</th><th>软件</th><th>状态</th>
                 <th>激活</th><th>解绑</th><th>到期</th><th>备注</th><th>操作</th>
               </tr>
@@ -1041,6 +1055,7 @@
     if ($("fProduct").value) q.push("product=" + encodeURIComponent($("fProduct").value));
     if ($("fStatus").value) q.push("status=" + encodeURIComponent($("fStatus").value));
     if ($("fQ").value.trim()) q.push("q=" + encodeURIComponent($("fQ").value.trim()));
+    if ($("hideExpired").checked) q.push("hide_expired=1");
 
     var r = await api("/licenses?" + q.join("&"), { method: "GET" });
     if (r.code !== 0) {
@@ -1062,15 +1077,36 @@
 
     r.data.rows.forEach(function (row) {
       var tr = document.createElement("tr");
-      tr.innerHTML =
+
+      // 卡密自身过期（expires_at 已过）与「授权到期」不是一回事，
+      // 这里标的是前者：卡密还没用就作废了
+      var expired = row.expires_at !== null && row.expires_at * 1000 <= Date.now();
+      var stateTag = expired
+        ? '<span class="tag disabled">已过期</span>'
+        : '<span class="tag ' + esc(row.status) + '">' + statusText[row.status] + "</span>";
+
+      var pick = document.createElement("td");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = "rowPick";
+      cb.value = row.key_prefix;
+      cb.style.width = "auto";
+      cb.onchange = updateSelCount;
+      pick.appendChild(cb);
+      tr.appendChild(pick);
+
+      // 其余单元格用 insertAdjacentHTML 追加，不会冲掉刚插入的复选框
+      tr.insertAdjacentHTML(
+        "beforeend",
         "<td>" + row.id + "</td>" +
         '<td class="mono">' + esc(row.key_prefix) + "…</td>" +
         "<td>" + esc(row.product) + "</td>" +
-        '<td><span class="tag ' + esc(row.status) + '">' + statusText[row.status] + "</span></td>" +
+        "<td>" + stateTag + "</td>" +
         "<td>" + row.activation_count + "/" + row.max_activations + "</td>" +
         "<td>" + row.unbind_count + "/" + row.max_unbinds + "</td>" +
         "<td>" + fmtTime(row.expires_at) + "</td>" +
-        "<td>" + esc(row.note || "") + "</td>";
+        "<td>" + esc(row.note || "") + "</td>",
+      );
 
       var td = document.createElement("td");
       td.appendChild(mkBtn("详情", function () { showDetail(row.key_prefix); }));
@@ -1078,15 +1114,77 @@
         ? mkBtn("解封", function () { setLicenseStatus(row.key_prefix, "unban"); })
         : mkBtn("封禁", function () { setLicenseStatus(row.key_prefix, "ban"); }, "danger"));
       td.appendChild(mkBtn("强制解绑", function () { forceUnbind(row.key_prefix); }));
+      td.appendChild(mkBtn("删除", function () { deleteLicenses([row.key_prefix]); }, "danger"));
       tr.appendChild(td);
       body.appendChild(tr);
     });
+
+    $("listAll").checked = false;
+    updateSelCount();
 
     var pages = Math.max(1, Math.ceil(state.total / state.pageSize));
     $("pageInfo").textContent = "第 " + state.page + " / " + pages + " 页，共 " + state.total + " 条";
     $("btnPrev").disabled = state.page <= 1;
     $("btnNext").disabled = state.page >= pages;
     $("lastUpdated").textContent = "最后更新 " + new Date().toLocaleTimeString("zh-CN");
+  }
+
+  /** 当前勾选的卡密前缀 */
+  function pickedKeys() {
+    return Array.prototype.slice
+      .call(document.querySelectorAll("#listBody .rowPick:checked"))
+      .map(function (cb) { return cb.value; });
+  }
+
+  function updateSelCount() {
+    var n = pickedKeys().length;
+    $("btnDeleteSelected").disabled = n === 0;
+    $("selCount").textContent = n === 0 ? "未选中" : "已选中 " + n + " 张";
+  }
+
+  /**
+   * 删除卡密（不可恢复）。
+   *
+   * 要求输入 DELETE 二次确认 —— 卡密删掉就找不回来了，
+   * 用户如果还留着那张卡密的备份也没用（服务端记录没了）。
+   * 操作记录会写进审计日志，事后能查到删了什么。
+   */
+  async function deleteLicenses(keys) {
+    if (!keys.length) return;
+
+    var tip = keys.length === 1
+      ? "确定删除卡密 " + keys[0] + "… ？\n\n卡密、绑定设备都会被清除，且不可恢复。\n" +
+        "操作记录会保留在「操作日志」里。"
+      : "确定删除选中的 " + keys.length + " 张卡密？\n\n" +
+        "卡密、绑定设备都会被清除，且不可恢复。\n" +
+        "操作记录会保留在「操作日志」里。";
+
+    if (!confirm(tip)) return;
+
+    // 二次确认：手打 DELETE，避免误点
+    var word = prompt("请输入 DELETE 确认删除（区分大小写）：");
+    if (word !== "DELETE") {
+      if (word !== null) alert("输入不匹配，已取消。");
+      return;
+    }
+
+    setMsg($("listMsg"), "删除中…");
+    var r = await api("/licenses/delete", { body: { keys: keys } });
+
+    if (r.code !== 0) {
+      setMsg($("listMsg"), "✗ " + r.msg, "err");
+      return;
+    }
+
+    var d = r.data;
+    var msg = "✓ 已删除 " + d.deleted + " 张卡密";
+    if (d.bindings) msg += "，连带清除 " + d.bindings + " 条设备绑定";
+    if (d.notFound && d.notFound.length) {
+      msg += "；" + d.notFound.length + " 张未找到（可能已被删或前缀有歧义）";
+    }
+    setMsg($("listMsg"), msg, "ok");
+
+    loadList();
   }
 
   async function setLicenseStatus(prefix, action) {
@@ -1425,6 +1523,7 @@
     "admin.token.revoke": "撤销令牌",
     "admin.force_check": "下发强制校验",
     "admin.force_check.clear": "撤销强制校验",
+    "admin.license.delete": "删除卡密",
     "admin.bootstrap": "初始化账户",
     "activate": "卡密激活",
     "check": "定期校验",
@@ -1624,6 +1723,13 @@
   $("btnGotoProducts").onclick = function () { switchTab("products"); };
 
   $("btnSearch").onclick = function () { state.page = 1; loadList(); };
+  $("hideExpired").onchange = function () { state.page = 1; loadList(); };
+  $("listAll").onchange = function () {
+    var on = this.checked;
+    document.querySelectorAll("#listBody .rowPick").forEach(function (cb) { cb.checked = on; });
+    updateSelCount();
+  };
+  $("btnDeleteSelected").onclick = function () { deleteLicenses(pickedKeys()); };
   $("autoRefresh").onchange = function () { setAutoRefresh(this.checked); };
   $("refreshSec").onchange = function () { if ($("autoRefresh").checked) setAutoRefresh(true); };
   $("btnPrev").onclick = function () { if (state.page > 1) { state.page--; loadList(); } };

@@ -1006,6 +1006,102 @@ async function run() {
     check("非法筛选参数被忽略而不是报错", bad.json?.code === 0, JSON.stringify(bad.json));
   }
 
+  section("21. 删除卡密与隐藏过期");
+  {
+    const g = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: PRODUCT, count: 3, note: "待删除测试" },
+    });
+    const keys = g.json?.data?.keys ?? [];
+    check("生成 3 张待删卡密", keys.length === 3, JSON.stringify(keys));
+
+    const before = await api("/admin/v1/licenses?q=待删除测试", { method: "GET", token: ADMIN_TOKEN });
+    check("删除前能查到", (before.json?.data?.total ?? 0) >= 3, JSON.stringify(before.json?.data));
+
+    // 先激活一张，验证设备绑定会被连带删除
+    const a = await activate({ license_key: keys[0], device_fp: FP_A });
+    check("激活其中一张", a.json?.code === 0, JSON.stringify(a.json));
+
+    // ---- 权限：删除是不可逆操作，只有管理级能做 ----
+    const opLogin = await rawPost("/api/v1/admin/login", {
+      username: ADMIN_USER, password: "new-password-9876",
+    });
+    const sess = opLogin.json?.data?.token;
+    const opTok = (await api("/admin/v1/tokens", {
+      token: sess, body: { role: "operator", ttl_seconds: 1800 },
+    })).json?.data?.token;
+
+    const opDel = await api("/admin/v1/licenses/delete", {
+      token: opTok, body: { keys: keys },
+    });
+    check("★ 运营令牌不能删除卡密（403）", opDel.status === 403, `HTTP ${opDel.status}`);
+
+    // ---- 正常删除 ----
+    const del = await api("/admin/v1/licenses/delete", {
+      token: ADMIN_TOKEN, body: { keys: keys },
+    });
+    check("★ 删除 3 张成功", del.json?.data?.deleted === 3, JSON.stringify(del.json));
+    check("★ 连带删除设备绑定", (del.json?.data?.bindings ?? 0) >= 1, JSON.stringify(del.json?.data));
+
+    const after = await api("/admin/v1/licenses?q=待删除测试", { method: "GET", token: ADMIN_TOKEN });
+    check("★ 删除后查不到", (after.json?.data?.total ?? 1) === 0, JSON.stringify(after.json?.data));
+
+    // ---- 审计日志必须保留 ----
+    const au = await api("/admin/v1/audit?event=admin.license.delete", {
+      method: "GET", token: ADMIN_TOKEN,
+    });
+    check("★ 删除操作被记入日志", (au.json?.data?.total ?? 0) >= 3, JSON.stringify(au.json?.data));
+    check("★ 日志里保留了被删卡密的信息",
+      String((au.json?.data?.rows ?? [])[0]?.detail || "").includes("prefix="),
+      JSON.stringify((au.json?.data?.rows ?? [])[0]));
+
+    // ---- 卡密删掉后，已发出的票据必须失效 ----
+    const afterDel = await api("/api/v1/entitlement", {
+      body: { ticket: a.json?.data?.ticket, device_fp: FP_A },
+    });
+    check("★ 卡密删除后其票据立即失效", afterDel.json?.code !== 0, JSON.stringify(afterDel.json));
+
+    // ---- 边界 ----
+    const nf = await api("/admin/v1/licenses/delete", {
+      token: ADMIN_TOKEN, body: { keys: ["ZZZZZZZZ"] },
+    });
+    check("删除不存在的卡密 → 记入 notFound 而不是报错",
+      (nf.json?.data?.notFound ?? []).length === 1, JSON.stringify(nf.json));
+
+    const empty = await api("/admin/v1/licenses/delete", {
+      token: ADMIN_TOKEN, body: { keys: [] },
+    });
+    check("空数组被拒（400）", empty.status === 400, `HTTP ${empty.status}`);
+
+    // ---- 隐藏过期 ----
+    const eg = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN,
+      body: { product: PRODUCT, count: 2, note: "过期测试", expires_in_days: 0 },
+    });
+    const expKeys = eg.json?.data?.keys ?? [];
+    check("生成 2 张立即过期的卡密", expKeys.length === 2, JSON.stringify(expKeys));
+
+    const withExp = await api("/admin/v1/licenses?q=过期测试", { method: "GET", token: ADMIN_TOKEN });
+    check("默认能查到已过期卡密", (withExp.json?.data?.total ?? 0) === 2, JSON.stringify(withExp.json?.data));
+
+    const hideExp = await api("/admin/v1/licenses?q=过期测试&hide_expired=1", {
+      method: "GET", token: ADMIN_TOKEN,
+    });
+    check("★ 勾选隐藏后查不到", (hideExp.json?.data?.total ?? 1) === 0, JSON.stringify(hideExp.json?.data));
+
+    // 永久有效的卡密不该被"隐藏过期"误伤
+    const perm = await api("/admin/v1/licenses?hide_expired=1&page_size=200", {
+      method: "GET", token: ADMIN_TOKEN,
+    });
+    const permRows = perm.json?.data?.rows ?? [];
+    check("★ 永久有效（expires_at 为 null）的卡密不被过滤",
+      permRows.every((r) => r.expires_at === null || r.expires_at * 1000 > Date.now()),
+      JSON.stringify(permRows.filter((r) => r.expires_at !== null).slice(0, 3)));
+
+    // 清理
+    await api("/admin/v1/licenses/delete", { token: ADMIN_TOKEN, body: { keys: expKeys } });
+  }
+
   // ============ 汇总 ============
 
   console.log("\n" + "─".repeat(50));
