@@ -697,19 +697,14 @@
     window.scrollTo(0, 0);
 
     var me = state.me;
-    var isAccount = me.source === "account";
 
-    // 账户登录是最高的第 4 级 —— 唯一能签发令牌的身份。
-    // 令牌登录最高只到「管理」，且拿不到签发令牌的能力，所以标签要区分开，
-    // 否则用户会以为手里的 root 令牌和账户一样能签发令牌。
-    $("roleBadge").textContent = isAccount ? "最高管理员" : (me.role_label || me.role);
+    // 标签与描述都由服务端给出（/me 会区分「账户会话」和「令牌身份」），
+    // 前端只负责加一句「为什么看不到令牌管理」的解释。
+    $("roleBadge").textContent = me.role_label || me.role;
     $("roleBadge").className = "tag " + me.role;
 
-    var desc = isAccount
-      ? "账户登录 · 唯一可签发与撤销令牌的身份"
-      : (me.role_desc || "");
-    var suffix = isAccount ? "" : "（令牌登录 · 无法管理令牌）";
-    $("whoami").textContent = me.name + " · " + desc + suffix;
+    var suffix = me.can_manage_tokens ? "" : "（令牌登录 · 无法管理令牌）";
+    $("whoami").textContent = me.name + " · " + (me.role_desc || "") + suffix;
 
     // 只有「账户密码登录」能管理令牌 —— 令牌不能派生令牌。
     // 用令牌登录时这个页签直接不显示，避免误以为可以签发。

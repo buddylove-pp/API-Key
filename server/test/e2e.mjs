@@ -561,6 +561,8 @@ async function run() {
     const meSession = await rawGet("/api/v1/admin/me", session);
     check("★ 账户会话的 can_manage_tokens 为 true",
       meSession.json?.data?.can_manage_tokens === true, JSON.stringify(meSession.json?.data));
+    check("★ 账户会话标签为「最高管理员」（第 4 级，与管理令牌区分）",
+      meSession.json?.data?.role_label === "最高管理员", meSession.json?.data?.role_label);
     check("账户会话的 source 为 account", meSession.json?.data?.source === "account");
     check("root 令牌的 source 为 token", meRootTok.json?.data?.source === "token");
 

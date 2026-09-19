@@ -328,13 +328,19 @@ export function buildRouter(deps: RouterDeps): Router {
     const id = await resolveIdentity(req);
     if (!id) throw new ServiceError(ErrCode.AUTH_REQUIRED, 401);
 
+    // 账户登录是最高的第 4 级，标签要与管理令牌区分开 ——
+    // 否则用户会以为手里的 root 令牌和账户一样能签发令牌。
+    const isAccount = id.source === "account";
+
     ok(res, {
       ...id,
-      role_label: ROLE_LABEL[id.role],
-      role_desc: ROLE_DESC[id.role],
+      role_label: isAccount ? "最高管理员" : ROLE_LABEL[id.role],
+      role_desc: isAccount
+        ? "账户登录 · 唯一可签发与撤销令牌的身份"
+        : ROLE_DESC[id.role],
       /** 只有账户密码登录能管理令牌 —— 令牌不能派生令牌 */
-      can_manage_tokens: id.source === "account" && id.role === "root",
-      can_change_password: id.source === "account",
+      can_manage_tokens: isAccount && id.role === "root",
+      can_change_password: isAccount,
       max_token_ttl_seconds: MAX_TOKEN_TTL_SECONDS,
       roles: (["readonly", "operator", "root"] as AdminRole[]).map((r) => ({
         value: r, label: ROLE_LABEL[r], desc: ROLE_DESC[r],
