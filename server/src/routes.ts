@@ -357,8 +357,45 @@ export function buildRouter(deps: RouterDeps): Router {
 
   // ---- 管理员令牌管理（仅 root） ----
 
-  admin.get("/tokens", requireAccount, wrap(async (_req, res) => {
-    ok(res, { tokens: await service.listAdminTokens() });
+  admin.get("/tokens", requireAccount, wrap(async (req, res) => {
+    const q = req.query;
+
+    const kindRaw = str(q["kind"]);
+    const roleRaw = str(q["role"]);
+    const stateRaw = str(q["state"]);
+    const sinceRaw = str(q["since_minutes"]);
+
+    const kind =
+      kindRaw === "session" || kindRaw === "issued" ? kindRaw : undefined;
+    const role =
+      roleRaw === "root" || roleRaw === "operator" || roleRaw === "readonly"
+        ? roleRaw
+        : undefined;
+    const state =
+      stateRaw === "active" || stateRaw === "revoked" || stateRaw === "expired"
+        ? stateRaw
+        : undefined;
+    const sinceMinutes = sinceRaw !== null ? Number(sinceRaw) : undefined;
+
+    const tokens = await service.listAdminTokens({
+      kind,
+      role,
+      state,
+      sinceMinutes:
+        sinceMinutes !== undefined && Number.isFinite(sinceMinutes) && sinceMinutes > 0
+          ? sinceMinutes
+          : undefined,
+    });
+
+    // 两类各有多少条（不受筛选影响），前端下拉里显示数量用
+    const all = await service.listAdminTokens({});
+    ok(res, {
+      tokens,
+      counts: {
+        session: all.filter((t) => t.is_session).length,
+        issued: all.filter((t) => !t.is_session).length,
+      },
+    });
   }));
 
   admin.post("/tokens", requireAccount, wrap(async (req, res) => {

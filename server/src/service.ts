@@ -1035,9 +1035,40 @@ export class LicenseService {
     return { token: raw, row: toTokenView(row) };
   }
 
-  async listAdminTokens(): Promise<AdminTokenRowView[]> {
+  /**
+   * 令牌列表，支持按类型 / 等级 / 状态 / 签发时间筛选。
+   *
+   * 为什么在后端筛
+   *   令牌会随时间累积（每次登录 +1），一年就是几千条。
+   *   而且面板里其它列表（卡密、日志）也都是后端筛选，保持一致。
+   */
+  async listAdminTokens(query: TokenQuery = {}): Promise<AdminTokenRowView[]> {
     const rows = await this.repo.listAdminTokens();
-    return rows.map(toTokenView);
+    const now = nowSec();
+    const cutoff =
+      query.sinceMinutes && query.sinceMinutes > 0 ? now - query.sinceMinutes * 60 : null;
+
+    return rows
+      .filter((r) => {
+        // owner_username 非空 = 账户登录产生的会话令牌
+        const isSession = r.owner_username !== null && r.owner_username !== undefined;
+
+        if (query.kind === "session" && !isSession) return false;
+        if (query.kind === "issued" && isSession) return false;
+        if (query.role !== undefined && r.role !== query.role) return false;
+
+        if (query.state !== undefined) {
+          const expired = r.expires_at <= now;
+          if (query.state === "revoked" && !r.revoked) return false;
+          // 已撤销的也算"不是有效"，所以这里要先排除已撤销
+          if (query.state === "expired" && (r.revoked || !expired)) return false;
+          if (query.state === "active" && (r.revoked || expired)) return false;
+        }
+
+        if (cutoff !== null && r.created_at < cutoff) return false;
+        return true;
+      })
+      .map(toTokenView);
   }
 
   async revokeAdminToken(id: number, by: string): Promise<void> {
@@ -1122,6 +1153,16 @@ export class LicenseService {
   async listAuditGlobal(query: AuditQuery) {
     return this.repo.listAuditGlobal(query);
   }
+}
+
+/** 令牌列表筛选条件 */
+export interface TokenQuery {
+  /** session = 账户登录产生的会话；issued = 账户手动签发的下级令牌 */
+  kind?: "session" | "issued";
+  role?: AdminRole;
+  state?: "active" | "revoked" | "expired";
+  /** 只看最近 N 分钟内签发的；不传 = 不限 */
+  sinceMinutes?: number;
 }
 
 /** 对外返回的令牌视图：不含哈希 */

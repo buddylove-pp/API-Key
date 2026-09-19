@@ -919,6 +919,93 @@ async function run() {
     check("强制校验的 check 日志有标记", forced, JSON.stringify((au2.json?.data?.rows ?? []).slice(0, 3)));
   }
 
+  section("20. 令牌筛选");
+  {
+    // 令牌接口要求「账户密码登录」，静态 ADMIN_TOKEN 不行。
+    // 而且第 18 节改过密码，这里要用改后的新密码。
+    const login = await rawPost("/api/v1/admin/login", {
+      username: ADMIN_USER, password: "new-password-9876",
+    });
+    const session = login.json?.data?.token;
+    check("取得账户会话（用于令牌接口）", typeof session === "string", JSON.stringify(login.json));
+
+    // 造几种不同类型的令牌，覆盖各筛选维度
+    await api("/admin/v1/tokens", {
+      token: session, body: { role: "readonly", name: "筛选-只读", ttl_seconds: 1800 },
+    });
+    await api("/admin/v1/tokens", {
+      token: session, body: { role: "operator", name: "筛选-运营", ttl_seconds: 1800 },
+    });
+    const mk = await api("/admin/v1/tokens", {
+      token: session, body: { role: "root", name: "筛选-管理", ttl_seconds: 1800 },
+    });
+    await api(`/admin/v1/tokens/${mk.json?.data?.id}/revoke`, { token: session, body: {} });
+
+    const all = await api("/admin/v1/tokens", { method: "GET", token: session });
+    check("可查全部令牌", all.json?.code === 0, JSON.stringify(all.json));
+    check("返回两类计数",
+      typeof all.json?.data?.counts?.session === "number" &&
+      typeof all.json?.data?.counts?.issued === "number",
+      JSON.stringify(all.json?.data?.counts));
+
+    const sess = await api("/admin/v1/tokens?kind=session", { method: "GET", token: session });
+    check("★ 按类型筛选：会话",
+      (sess.json?.data?.tokens ?? []).every((t) => t.is_session),
+      JSON.stringify((sess.json?.data?.tokens ?? []).slice(0, 3)));
+
+    const issued = await api("/admin/v1/tokens?kind=issued", { method: "GET", token: session });
+    check("★ 按类型筛选：已签发",
+      (issued.json?.data?.tokens ?? []).length > 0 &&
+      (issued.json?.data?.tokens ?? []).every((t) => !t.is_session));
+
+    const ro = await api("/admin/v1/tokens?kind=issued&role=readonly", {
+      method: "GET", token: session,
+    });
+    check("★ 按等级筛选",
+      (ro.json?.data?.tokens ?? []).every((t) => t.role === "readonly"),
+      JSON.stringify((ro.json?.data?.tokens ?? []).map((t) => t.role)));
+
+    const rev = await api("/admin/v1/tokens?kind=issued&state=revoked", {
+      method: "GET", token: session,
+    });
+    check("★ 按状态筛选：已撤销",
+      (rev.json?.data?.tokens ?? []).length > 0 &&
+      (rev.json?.data?.tokens ?? []).every((t) => t.revoked === true));
+
+    const act = await api("/admin/v1/tokens?kind=issued&state=active", {
+      method: "GET", token: session,
+    });
+    check("★ 按状态筛选：有效",
+      (act.json?.data?.tokens ?? []).every((t) => !t.revoked && !t.expired),
+      JSON.stringify((act.json?.data?.tokens ?? []).map((t) => [t.revoked, t.expired])));
+
+    const now = Math.floor(Date.now() / 1000);
+    const recent = await api("/admin/v1/tokens?since_minutes=30", { method: "GET", token: session });
+    check("★ 按时间筛选：最近 30 分钟",
+      (recent.json?.data?.tokens ?? []).every((t) => now - t.created_at <= 30 * 60 + 5),
+      JSON.stringify((recent.json?.data?.tokens ?? []).map((t) => now - t.created_at)));
+
+    const oldOnly = await api("/admin/v1/tokens?since_minutes=1", { method: "GET", token: session });
+    check("★ 时间窗口收窄后条数不增加",
+      (oldOnly.json?.data?.tokens ?? []).length <= (recent.json?.data?.tokens ?? []).length);
+
+    const combo = await api(
+      "/admin/v1/tokens?kind=issued&role=readonly&state=active&since_minutes=30",
+      { method: "GET", token: session },
+    );
+    check("★ 四个条件组合筛选",
+      (combo.json?.data?.tokens ?? []).every(
+        (t) => !t.is_session && t.role === "readonly" && !t.revoked && !t.expired,
+      ),
+      JSON.stringify((combo.json?.data?.tokens ?? []).map((t) => [t.is_session, t.role, t.revoked])));
+
+    const bad = await api(
+      "/admin/v1/tokens?kind=xxx&role=yyy&state=zzz&since_minutes=abc",
+      { method: "GET", token: session },
+    );
+    check("非法筛选参数被忽略而不是报错", bad.json?.code === 0, JSON.stringify(bad.json));
+  }
+
   // ============ 汇总 ============
 
   console.log("\n" + "─".repeat(50));

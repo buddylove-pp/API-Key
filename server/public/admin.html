@@ -471,50 +471,52 @@
       </div>
 
       <div class="panel">
-        <h2>登录会话</h2>
-        <div class="hint" style="margin-bottom:12px">
-          账户密码登录后自动产生的短期凭据（12 小时）。你不需要手动复制它 ——
-          浏览器已经存好了。之所以要有它，是因为 HTTP 无状态：要么每次请求都带账号密码
-          （密码反复暴露），要么登录一次换一个可撤销、可过期、可审计的令牌。这里列出是给你看
-          「谁在什么时候登录过」，怀疑异常时可以立即撤销。
-        </div>
-        <div class="row">
-          <button id="btnRefreshSessions" class="sm">刷新</button>
-        </div>
-        <div style="overflow:auto; margin-top:12px">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th><th>账户</th><th>前缀</th><th>角色</th>
-                <th>登录时间</th><th>到期时间</th><th>最近使用</th><th>状态</th><th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="sessionBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>已签发的令牌</h2>
-        <div class="hint" style="margin-bottom:12px">
-          由账户手动签发、给外部程序或运维用的令牌。
-          <strong>令牌不能签发令牌</strong> —— 只有账户密码登录能签发，防止权限无限自我复制。
-        </div>
-        <div class="row">
+        <div class="row" style="align-items:flex-end;gap:12px;flex-wrap:wrap">
+          <div class="field">
+            <label>查看</label>
+            <select id="tkKind" style="min-width:190px">
+              <option value="session">登录会话</option>
+              <option value="issued">已签发的令牌</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>令牌等级</label>
+            <select id="tkRole" style="min-width:110px">
+              <option value="">全部</option>
+              <option value="readonly">只读</option>
+              <option value="operator">运营</option>
+              <option value="root">管理</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>状态</label>
+            <select id="tkState" style="min-width:110px">
+              <option value="">全部</option>
+              <option value="active">有效</option>
+              <option value="revoked">已撤销</option>
+              <option value="expired">已过期</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>签发时间</label>
+            <select id="tkSince" style="min-width:140px">
+              <option value="">全部</option>
+              <option value="30">最近 30 分钟</option>
+              <option value="60">最近 1 小时</option>
+              <option value="180">最近 3 小时</option>
+              <option value="360">最近 6 小时</option>
+              <option value="1440">最近 24 小时</option>
+              <option value="10080">最近 7 天</option>
+            </select>
+          </div>
           <button id="btnRefreshTokens" class="sm">刷新</button>
+          <button id="btnResetTkFilter" class="sm">重置</button>
+          <span id="tkSummary" class="hint" style="margin-left:auto"></span>
         </div>
+
+        <div id="tkDesc" class="hint" style="margin:14px 0 0"></div>
         <div id="tokenListMsg" class="msg"></div>
-        <div style="overflow:auto; margin-top:12px">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th><th>前缀</th><th>备注</th><th>角色</th><th>签发者</th>
-                <th>签发时间</th><th>到期时间</th><th>最近使用</th><th>状态</th><th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="tokenBody"></tbody>
-          </table>
-        </div>
+        <div id="tkTableWrap" style="overflow:auto; margin-top:12px"></div>
       </div>
     </section>
 
@@ -1260,83 +1262,119 @@
     return { text: "有效", cls: "active" };
   }
 
+  /** 当前筛选条件 */
+  function tkFilter() {
+    return {
+      kind: $("tkKind").value,
+      role: $("tkRole").value,
+      state: $("tkState").value,
+      since: $("tkSince").value,
+    };
+  }
+
+  function roleTag(role) {
+    return '<span class="tag ' + esc(role) + '">' + (ROLE_LABEL[role] || role) + "</span>";
+  }
+
   async function loadTokens() {
-    var r = await api("/tokens", { method: "GET" });
+    var f = tkFilter();
+    var q = ["kind=" + encodeURIComponent(f.kind)];
+    if (f.role) q.push("role=" + encodeURIComponent(f.role));
+    if (f.state) q.push("state=" + encodeURIComponent(f.state));
+    if (f.since) q.push("since_minutes=" + encodeURIComponent(f.since));
+
+    var r = await api("/tokens?" + q.join("&"), { method: "GET" });
     if (r.code !== 0) {
       setMsg($("tokenListMsg"), "✗ " + r.msg, "err");
       return;
     }
     setMsg($("tokenListMsg"), "");
 
-    var all = r.data.tokens || [];
-    renderSessions(all.filter(function (t) { return t.is_session; }));
-    renderIssued(all.filter(function (t) { return !t.is_session; }));
+    var rows = r.data.tokens || [];
+    var counts = r.data.counts || { session: 0, issued: 0 };
+    var isSession = f.kind === "session";
+
+    // 说明随类型切换 —— 两类令牌的存在理由完全不同，不能共用一段话
+    $("tkDesc").innerHTML = isSession
+      ? "账户密码登录后自动产生的短期凭据（12 小时）。<strong>你不需要手动复制它</strong> —— " +
+        "浏览器已经存好了。之所以要有它，是因为 HTTP 无状态：要么每次请求都带账号密码" +
+        "（密码反复暴露），要么登录一次换一个可撤销、可过期、可审计的令牌。" +
+        "这里列出是给你看「谁在什么时候登录过」，怀疑异常时可以立即撤销。"
+      : "由账户手动签发、给外部程序或运维用的令牌。" +
+        "<strong>令牌不能签发令牌</strong> —— 只有账户密码登录能签发，防止权限无限自我复制。";
+
+    $("tkSummary").textContent =
+      "登录会话 " + counts.session + " 条 · 已签发 " + counts.issued + " 条" +
+      "（当前筛选出 " + rows.length + " 条）";
+
+    renderTokenTable(rows, isSession);
   }
 
-  /** 账户登录产生的会话令牌 */
-  function renderSessions(rows) {
-    var body = $("sessionBody");
-    body.innerHTML = "";
+  /** 两类令牌列不同但结构一致，共用一份渲染逻辑 */
+  function renderTokenTable(rows, isSession) {
+    var cols = isSession
+      ? ["ID", "账户", "前缀", "等级", "登录时间", "到期时间", "最近使用", "状态", "操作"]
+      : ["ID", "前缀", "备注", "等级", "签发者", "签发时间", "到期时间", "最近使用", "状态", "操作"];
+
+    var wrap = $("tkTableWrap");
+
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="9" class="hint">暂无登录会话</td></tr>';
+      wrap.innerHTML = '<div class="hint" style="padding:16px 0">' +
+        (isSession ? "没有符合条件的登录会话" : "没有符合条件的已签发令牌") + "</div>";
       return;
     }
 
+    var html = "<table><thead><tr>";
+    cols.forEach(function (c) { html += "<th>" + c + "</th>"; });
+    html += "</tr></thead><tbody></tbody></table>";
+    wrap.innerHTML = html;
+
+    var tbody = wrap.querySelector("tbody");
+
     rows.forEach(function (t) {
       var st = tokenState(t);
+      var stateTag = '<span class="tag ' + st.cls + '">' + st.text + "</span>";
+
+      var cells = isSession
+        ? [
+            t.id,
+            esc(t.owner_username || t.created_by),
+            '<span class="mono">' + esc(t.token_prefix) + "…</span>",
+            roleTag(t.role),
+            fmtTime(t.created_at),
+            fmtTime(t.expires_at),
+            fmtTime(t.last_used_at),
+            stateTag,
+          ]
+        : [
+            t.id,
+            '<span class="mono">' + esc(t.token_prefix) + "…</span>",
+            esc(t.name || "—"),
+            roleTag(t.role),
+            esc(t.created_by),
+            fmtTime(t.created_at),
+            fmtTime(t.expires_at),
+            fmtTime(t.last_used_at),
+            stateTag,
+          ];
+
       var tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + t.id + "</td>" +
-        "<td>" + esc(t.owner_username || t.created_by) + "</td>" +
-        '<td class="mono">' + esc(t.token_prefix) + "…</td>" +
-        '<td><span class="tag ' + t.role + '">' + ROLE_LABEL[t.role] + "</span></td>" +
-        "<td>" + fmtTime(t.created_at) + "</td>" +
-        "<td>" + fmtTime(t.expires_at) + "</td>" +
-        "<td>" + fmtTime(t.last_used_at) + "</td>" +
-        '<td><span class="tag ' + st.cls + '">' + st.text + "</span></td>";
+      cells.forEach(function (c) {
+        var td = document.createElement("td");
+        td.innerHTML = String(c);
+        tr.appendChild(td);
+      });
 
       var td = document.createElement("td");
       if (!t.revoked && !t.expired) {
-        td.appendChild(mkBtn("撤销", function () { revokeToken(t.id, "登录会话"); }, "danger"));
+        td.appendChild(mkBtn("撤销", function () {
+          revokeToken(t.id, isSession ? "登录会话" : "令牌");
+        }, "danger"));
       } else {
         td.innerHTML = '<span class="hint">—</span>';
       }
       tr.appendChild(td);
-      body.appendChild(tr);
-    });
-  }
-
-  /** 账户手动签发的下级令牌 */
-  function renderIssued(rows) {
-    var body = $("tokenBody");
-    body.innerHTML = "";
-    if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="10" class="hint">暂无已签发的令牌</td></tr>';
-      return;
-    }
-
-    rows.forEach(function (t) {
-      var st = tokenState(t);
-      var tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + t.id + "</td>" +
-        '<td class="mono">' + esc(t.token_prefix) + "…</td>" +
-        "<td>" + esc(t.name || "—") + "</td>" +
-        '<td><span class="tag ' + t.role + '">' + ROLE_LABEL[t.role] + "</span></td>" +
-        "<td>" + esc(t.created_by) + "</td>" +
-        "<td>" + fmtTime(t.created_at) + "</td>" +
-        "<td>" + fmtTime(t.expires_at) + "</td>" +
-        "<td>" + fmtTime(t.last_used_at) + "</td>" +
-        '<td><span class="tag ' + st.cls + '">' + st.text + "</span></td>";
-
-      var td = document.createElement("td");
-      if (!t.revoked && !t.expired) {
-        td.appendChild(mkBtn("撤销", function () { revokeToken(t.id, "令牌"); }, "danger"));
-      } else {
-        td.innerHTML = '<span class="hint">—</span>';
-      }
-      tr.appendChild(td);
-      body.appendChild(tr);
+      tbody.appendChild(tr);
     });
   }
 
@@ -1598,7 +1636,18 @@
 
   $("btnCreateToken").onclick = createToken;
   $("btnRefreshTokens").onclick = loadTokens;
-  $("btnRefreshSessions").onclick = loadTokens;
+
+  // 筛选下拉改完立即生效 —— 令牌量不大，不需要再点「查询」
+  ["tkKind", "tkRole", "tkState", "tkSince"].forEach(function (id) {
+    $(id).onchange = loadTokens;
+  });
+  $("btnResetTkFilter").onclick = function () {
+    $("tkKind").value = "session";
+    $("tkRole").value = "";
+    $("tkState").value = "";
+    $("tkSince").value = "";
+    loadTokens();
+  };
 
   // ---------- 操作日志 ----------
 
