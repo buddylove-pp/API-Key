@@ -1102,6 +1102,28 @@ async function run() {
     await api("/admin/v1/licenses/delete", { token: ADMIN_TOKEN, body: { keys: expKeys } });
   }
 
+  section("22. 健康检查真实探活");
+  {
+    const h = await fetch(BASE + "/health").then((r) => r.json());
+    check("健康检查可用", h.code === 0, JSON.stringify(h));
+    check("★ 返回 db_reachable（而不是只看启动状态）",
+      typeof h.data?.db_reachable === "boolean", JSON.stringify(h.data));
+    check("★ 数据库可达", h.data?.db_reachable === true, JSON.stringify(h.data));
+    check("可达时不返回错误详情", h.data?.db_error === null, JSON.stringify(h.data));
+    check("状态为 up", h.data?.status === "up", h.data?.status);
+    check("保留了启动期诊断信息",
+      "db_driver" in (h.data ?? {}) && "init_error" in (h.data ?? {}),
+      JSON.stringify(h.data));
+
+    // 探活必须是真查询：连续调用都能通过，说明每次都真的走了连接
+    let allOk = true;
+    for (let i = 0; i < 3; i++) {
+      const r = await fetch(BASE + "/health").then((x) => x.json());
+      if (r.data?.db_reachable !== true) allOk = false;
+    }
+    check("★ 连续探活都成功（真查询而非缓存）", allOk);
+  }
+
   // ============ 汇总 ============
 
   console.log("\n" + "─".repeat(50));
