@@ -508,7 +508,11 @@ async function run() {
     check("root 账户角色为 root", login.json?.data?.role === "root");
 
     const me = await api("/api/v1/admin/me", { method: "GET", token: session });
-    check("会话令牌可查当前身份", me.json?.data?.role === "root", JSON.stringify(me.json));
+    // 账户的有效等级是最高一级。库里存的 role 是 "root"，
+    // 但账户比最高的令牌（root_plus）还高，所以对外统一报 root_plus，
+    // 否则 roleAtLeast 会把它当成普通「管理」令牌。
+    check("★ 会话令牌的有效等级为最高（root_plus）",
+      me.json?.data?.role === "root_plus", JSON.stringify(me.json?.data?.role));
 
     const mk = await api("/admin/v1/tokens", {
       token: session,
@@ -1225,6 +1229,19 @@ async function run() {
       token: rootPlusTok, body: { keys: [k] },
     });
     check("★ 管理+ 令牌可以删除卡密", rootPlusDel.json?.code === 0, JSON.stringify(rootPlusDel.json));
+
+    // ---- 账户登录是最高一级，必须能做最高级的操作 ----
+    // 曾经出过 bug：账户身份的 role 直接用了数据库里的 "root"，
+    // 而删除需要 root_plus，结果账户连自己发的卡密都删不掉。
+    const acctG = await api("/admin/v1/licenses/generate", {
+      token: sess, body: { product: PRODUCT, count: 1 },
+    });
+    const acctK = acctG.json?.data?.keys?.[0];
+    const acctDel = await api("/admin/v1/licenses/delete", {
+      token: sess, body: { keys: [acctK] },
+    });
+    check("★ 账户登录可以删除卡密（不该被自己发的令牌挡住）",
+      acctDel.json?.code === 0, JSON.stringify(acctDel.json));
 
     // ---- 标签 ----
     const meOp = await rawGet("/api/v1/admin/me", opTok);

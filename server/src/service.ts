@@ -1087,7 +1087,12 @@ export class LicenseService {
     if (row.owner_username !== null) {
       return {
         name: row.owner_username,
-        role: row.role,
+        // ⚠️ 固定给 root_plus，不要用 row.role。
+        //
+        // 账户登录是**第 6 级**，比最高的令牌（root_plus，第 5 级）还高。
+        // 但数据库里存的 role 是 "root" —— 直接用它会让 roleAtLeast 把账户
+        // 当成普通「管理」令牌，结果账户连自己发的卡密都删不掉。
+        role: "root_plus",
         source: "account",
         username: row.owner_username,
       };

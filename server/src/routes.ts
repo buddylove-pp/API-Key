@@ -390,7 +390,10 @@ export function buildRouter(deps: RouterDeps): Router {
         ? "账户登录 · 唯一可签发与撤销令牌的身份"
         : ROLE_DESC[id.role],
       /** 只有账户密码登录能管理令牌 —— 令牌不能派生令牌 */
-      can_manage_tokens: isAccount && id.role === "root",
+      // 账户登录是唯一能签发令牌的身份（令牌不能派生令牌）。
+      // 判据是 source === "account"，不是 role —— 账户的 role 现在统一是
+      // root_plus（最高一级令牌），两者不是一回事。
+      can_manage_tokens: isAccount,
       can_change_password: isAccount,
       max_token_ttl_seconds: limits.maxTokenTtlSeconds,
       /** 当前身份能设的最大值。前端据此设 max 属性并给出提示 */
