@@ -71,6 +71,12 @@ export const config = {
 
   publicBaseUrl: optional("PUBLIC_BASE_URL", ""),
   autoMigrate: bool("AUTO_MIGRATE", true),
+  /**
+   * 数据库看门狗间隔（秒）。0 = 关闭。
+   *
+   * 后台定期探活，连续失败就重建连接池 —— 连接被静默断开时能自愈。
+   */
+  dbWatchdogSec: num("DB_WATCHDOG_SEC", 60),
 
   /**
    * 票据（离线容忍窗口）最大天数。

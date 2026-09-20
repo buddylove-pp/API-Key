@@ -58,8 +58,10 @@ function str(v: unknown): string | null {
  *
  * 必须剥掉连接串 —— pg 的报错里经常带着 host / user / password，
  * 直接透到 /health 上等于把数据库凭据公开了。
+ *
+ * 导出是为了能单测：这是有安全影响的纯函数，不该只靠人工检查。
  */
-function sanitizeDbError(e: unknown): string {
+export function sanitizeDbError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
   return raw
     .replace(/(postgres(?:ql)?:\/\/)[^\s]+/gi, "$1***")

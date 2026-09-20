@@ -231,6 +231,16 @@ export interface Repo {
    * 表现出来就是所有接口 500、但 /health 还报 "up"。
    */
   ping(): Promise<void>;
+  /**
+   * 重建连接池。
+   *
+   * 用于连接被静默断开后自愈 —— 池里可能全是死连接，
+   * 单纯重试没用，必须整池换掉。
+   *
+   * ⚠️ 只应在**后台探活**发现失败时调用，不要挂在用户请求的重试逻辑上：
+   *    连接可能在语句执行到一半时断掉，盲目重放 INSERT 会写重复数据。
+   */
+  reconnect(): Promise<void>;
   close(): Promise<void>;
 
   createLicense(input: CreateLicenseInput): Promise<LicenseRow>;
@@ -345,6 +355,11 @@ export class MemoryRepo implements Repo {
 
   /** 内存实现没有外部依赖，永远可用 */
   async ping(): Promise<void> {
+    return;
+  }
+
+  /** 内存实现没有连接池，无需重建 */
+  async reconnect(): Promise<void> {
     return;
   }
 
@@ -806,6 +821,23 @@ export class PgRepo implements Repo {
 
   async ping(): Promise<void> {
     await this.pool.query("SELECT 1");
+  }
+
+  /**
+   * 重建连接池。
+   *
+   * `pool.end()` 在池已经坏掉时可能一直挂着，所以加超时兜底 ——
+   * 自愈逻辑本身不能变成新的卡死点。
+   */
+  async reconnect(): Promise<void> {
+    const old = this.pool;
+    // 先换上新池，让后续请求立刻可用；旧池在后台慢慢收尾
+    this.pool = this.makePool(this.connectionString, this.sslEnabled);
+
+    await Promise.race([
+      old.end().catch(() => undefined),
+      new Promise((r) => setTimeout(r, 3_000)),
+    ]);
   }
 
   async createLicense(input: CreateLicenseInput): Promise<LicenseRow> {

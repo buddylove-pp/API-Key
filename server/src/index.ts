@@ -111,6 +111,53 @@ async function main(): Promise<void> {
     }),
   }));
 
+  /**
+   * 数据库看门狗。
+   *
+   * 为什么需要：连接可能被数据库、负载均衡或防火墙**静默断开**，
+   * 而进程自己不知道 —— 表现就是所有接口 500（2026-09-20 真实发生过一次，
+   * 当时 /health 还在报 up，排查绕了很大弯）。
+   *
+   * 为什么放后台而不是挂在请求的重试逻辑上：
+   *   连接可能在语句执行到一半时断掉，盲目重放 INSERT 会写重复数据。
+   *   后台探活不涉及任何业务语句，重建连接池是安全的。
+   */
+  function startDbWatchdog(): NodeJS.Timeout | null {
+    if (config.dbWatchdogSec <= 0) return null;
+
+    let fails = 0;
+
+    return setInterval(() => {
+      void (async () => {
+        try {
+          await service.ping();
+          if (fails > 0) {
+            console.log(`[db] 探活恢复正常（此前连续失败 ${fails} 次）`);
+            fails = 0;
+          }
+        } catch (e) {
+          fails++;
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn(`[db] 探活失败第 ${fails} 次：${msg}`);
+
+          // 连续两次才重建 —— 单次抖动不值得动池
+          if (fails >= 2) {
+            console.warn("[db] 连续探活失败，重建连接池…");
+            try {
+              await service.reconnect();
+              console.log("[db] 连接池已重建");
+            } catch (re) {
+              console.error("[db] 重建连接池失败：", re);
+            }
+            fails = 0;
+          }
+        }
+      })();
+    }, config.dbWatchdogSec * 1000).unref();
+  }
+
+  const watchdog = startDbWatchdog();
+
   const server = app.listen(config.port, () => {
     console.log("──────────────────────────────────────────────");
     console.log("  卡密授权服务已启动");
@@ -129,6 +176,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`\n收到 ${signal}，正在优雅关闭…`);
 
+    if (watchdog) clearInterval(watchdog);
     server.close();
     try {
       await repo.close();

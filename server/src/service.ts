@@ -888,6 +888,11 @@ export class LicenseService {
     await this.repo.ping();
   }
 
+  /** 重建连接池：供后台看门狗在连续探活失败后调用 */
+  async reconnect(): Promise<void> {
+    await this.repo.reconnect();
+  }
+
   async setStatus(lic: LicenseRow, status: "unused" | "active" | "banned", ctx: CallContext): Promise<void> {
     await this.repo.setLicenseStatus(lic.id, status);
     await this.repo.audit({
