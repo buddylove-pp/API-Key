@@ -1039,12 +1039,28 @@ async function run() {
     });
     check("★ 运营令牌不能删除卡密（403）", opDel.status === 403, `HTTP ${opDel.status}`);
 
-    // ---- 正常删除 ----
-    const del = await api("/admin/v1/licenses/delete", {
+    // ---- 删除：正在使用的会被挡下，必须先封禁 ----
+    const del1 = await api("/admin/v1/licenses/delete", {
       token: ADMIN_TOKEN, body: { keys: keys },
     });
-    check("★ 删除 3 张成功", del.json?.data?.deleted === 3, JSON.stringify(del.json));
-    check("★ 连带删除设备绑定", (del.json?.data?.bindings ?? 0) >= 1, JSON.stringify(del.json?.data));
+    check("★ 已激活的卡密不能直接删（只删掉 2 张未使用的）",
+      del1.json?.data?.deleted === 2, JSON.stringify(del1.json?.data));
+    check("★ 返回 blocked 并说明原因",
+      (del1.json?.data?.blocked ?? []).length === 1 &&
+      String(del1.json?.data?.blocked?.[0]?.reason ?? "").includes("设备"),
+      JSON.stringify(del1.json?.data?.blocked));
+
+    // 封禁后即可删除 —— 这正是用户要走的流程
+    const banR = await api("/admin/v1/licenses/ban", {
+      token: ADMIN_TOKEN, body: { license_key: keys[0] },
+    });
+    check("封禁成功", banR.json?.code === 0, JSON.stringify(banR.json));
+
+    const del2 = await api("/admin/v1/licenses/delete", {
+      token: ADMIN_TOKEN, body: { keys: [keys[0]] },
+    });
+    check("★ 封禁后可以删除", del2.json?.data?.deleted === 1, JSON.stringify(del2.json?.data));
+    check("★ 连带删除设备绑定", (del2.json?.data?.bindings ?? 0) >= 1, JSON.stringify(del2.json?.data));
 
     const after = await api("/admin/v1/licenses?q=待删除测试", { method: "GET", token: ADMIN_TOKEN });
     check("★ 删除后查不到", (after.json?.data?.total ?? 1) === 0, JSON.stringify(after.json?.data));

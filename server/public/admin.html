@@ -1216,6 +1216,8 @@
 
     r.data.rows.forEach(function (row) {
       var tr = document.createElement("tr");
+      // 记下状态，批量删除时好在确认前拦下「正在使用」的
+      tr.dataset.status = row.status;
 
       // 卡密自身过期（expires_at 已过）与「授权到期」不是一回事，
       // 这里标的是前者：卡密还没用就作废了
@@ -1253,7 +1255,21 @@
         ? mkBtn("解封", function () { setLicenseStatus(row.key_prefix, "unban"); })
         : mkBtn("封禁", function () { setLicenseStatus(row.key_prefix, "ban"); }, "danger"));
       td.appendChild(mkBtn("强制解绑", function () { forceUnbind(row.key_prefix); }));
-      td.appendChild(mkBtn("删除", function () { deleteLicenses([row.key_prefix]); }, "danger"));
+
+      // 正在使用的不给直接删。在**点击时**就拦下 ——
+      // 让用户填完 DELETE 再被拒，白费一遍操作。
+      // 服务端还会再查一次绑定（这里只看状态，够快），最终以服务端为准。
+      td.appendChild(mkBtn("删除", function () {
+        if (row.status === "active") {
+          alert(
+            "卡密 " + row.key_prefix + "… 正在使用，不能直接删除。\n\n" +
+            "请先点「封禁」，封禁后再删除。\n" +
+            "（封禁可撤销，删除不可恢复 —— 所以强制先封禁。）",
+          );
+          return;
+        }
+        deleteLicenses([row.key_prefix]);
+      }, "danger"));
       tr.appendChild(td);
       body.appendChild(tr);
     });
@@ -1291,6 +1307,27 @@
   async function deleteLicenses(keys) {
     if (!keys.length) return;
 
+    // 选中的里面有「正在使用」的，先在确认框之前拦下 ——
+    // 否则用户填完 DELETE 才被拒，白费一遍操作。
+    // 服务端还会再查一次绑定（这里只看状态），最终以服务端为准。
+    var inUse = [];
+    document.querySelectorAll("#listBody tr").forEach(function (tr) {
+      var cb = tr.querySelector(".rowPick");
+      if (cb && cb.checked && tr.dataset.status === "active") {
+        inUse.push(cb.value);
+      }
+    });
+
+    if (inUse.length) {
+      alert(
+        "选中的卡密里有 " + inUse.length + " 张正在使用，不能直接删除：\n\n" +
+        inUse.map(function (k) { return "  · " + k + "…"; }).join("\n") + "\n\n" +
+        "请先「封禁」这些卡密，封禁后再删除。\n" +
+        "（封禁可撤销，删除不可恢复 —— 所以强制先封禁。）",
+      );
+      return;
+    }
+
     var tip = keys.length === 1
       ? "确定删除卡密 " + keys[0] + "… ？\n\n卡密、绑定设备都会被清除，且不可恢复。\n" +
         "操作记录会保留在「操作日志」里。"
@@ -1316,12 +1353,32 @@
     }
 
     var d = r.data;
+
+    // 被「正在使用」挡下的要单独说清楚，并给出下一步该怎么做 ——
+    // 只说"删除失败"用户会不知道卡在哪
+    if (d.blocked && d.blocked.length) {
+      var lines = d.blocked.map(function (b) {
+        return "  · " + b.prefix + "…  " + b.reason;
+      }).join("\n");
+      var head = d.deleted > 0 ? "✓ 已删除 " + d.deleted + " 张\n\n" : "";
+      alert(
+        head +
+        "以下 " + d.blocked.length + " 张正在使用，不能直接删除：\n\n" +
+        lines + "\n\n" +
+        "要删除它们，请先点「封禁」，封禁后再删除。\n" +
+        "（封禁可撤销，删除不可恢复 —— 所以强制先封禁。）",
+      );
+    }
+
     var msg = "✓ 已删除 " + d.deleted + " 张卡密";
     if (d.bindings) msg += "，连带清除 " + d.bindings + " 条设备绑定";
+    if (d.blocked && d.blocked.length) {
+      msg += "；" + d.blocked.length + " 张因「正在使用」被挡下（需先封禁）";
+    }
     if (d.notFound && d.notFound.length) {
       msg += "；" + d.notFound.length + " 张未找到（可能已被删或前缀有歧义）";
     }
-    setMsg($("listMsg"), msg, "ok");
+    setMsg($("listMsg"), msg, d.blocked && d.blocked.length ? "err" : "ok");
 
     loadList();
   }

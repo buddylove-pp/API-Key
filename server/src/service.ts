@@ -833,17 +833,31 @@ export class LicenseService {
   /**
    * 批量删除卡密。
    *
+   * ⚠️ **正在使用的卡密不能直接删，必须先封禁。**
+   *
+   * 为什么加这道刹车：删掉一张正在用的卡密，用户那边下次心跳就突然失效了，
+   * 而管理员可能只是想清理测试数据。封禁是有记录、可撤销的；删除是不可逆的。
+   * 强制先封禁，等于让操作者多看一眼「这张卡密真的在用」。
+   *
+   * 封禁过的放行 —— 那正是要走的流程（先封禁，再删除）。
+   *
    * 每张卡密都先写审计日志再删 —— 顺序不能反，
    * 反了就只能记下"删了某张卡密"而不知道它当时是什么状态。
-   *
    * 审计日志本身不删：那是历史记录，删掉就查不到
    * "这张卡密曾经被谁激活过、什么时候被封过"了。
    */
   async deleteLicenses(
     inputs: string[], by: string, ctx: CallContext,
-  ): Promise<{ deleted: number; notFound: string[]; bindings: number }> {
+  ): Promise<{
+    deleted: number;
+    notFound: string[];
+    /** 因「正在使用」被挡下的卡密，前端据此提示用户先封禁 */
+    blocked: { prefix: string; reason: string }[];
+    bindings: number;
+  }> {
     const now = nowSec();
     const notFound: string[] = [];
+    const blocked: { prefix: string; reason: string }[] = [];
     let deleted = 0;
     let bindings = 0;
 
@@ -865,6 +879,22 @@ export class LicenseService {
         continue;
       }
 
+      // ── 刹车：正在使用的不给删 ──
+      // 「正在使用」= 状态为已激活，或还有设备绑定着。
+      // 已封禁的放行 —— 那正是用户要走的流程（先封禁，再删除）。
+      if (lic.status !== "banned") {
+        const bound = await this.repo.listBindings(lic.id);
+        if (lic.status === "active" || bound.length > 0) {
+          blocked.push({
+            prefix: lic.key_prefix,
+            reason: bound.length > 0
+              ? `仍有 ${bound.length} 台设备在使用`
+              : "状态为「已激活」",
+          });
+          continue;
+        }
+      }
+
       // 先留痕再删
       await this.repo.audit({
         license_id: lic.id,
@@ -880,7 +910,7 @@ export class LicenseService {
       deleted++;
     }
 
-    return { deleted, notFound, bindings };
+    return { deleted, notFound, blocked, bindings };
   }
 
   /** 探活：供 /health 做真实的连接检查 */
