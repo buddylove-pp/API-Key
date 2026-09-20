@@ -271,6 +271,7 @@
 
       <div class="panel">
         <h2>生成卡密</h2>
+        <div id="genLimitHint" class="hint" style="margin:-6px 0 14px"></div>
         <div class="row">
           <div class="field">
             <label>软件（已启用的）</label>
@@ -532,11 +533,8 @@
           </div>
           <div class="field">
             <label>令牌等级</label>
-            <select id="tkRole" style="min-width:110px">
-              <option value="">全部</option>
-              <option value="readonly">只读</option>
-              <option value="operator">运营</option>
-              <option value="root">管理</option>
+            <select id="tkRole" style="min-width:120px">
+              <option value="">全部等级</option>
             </select>
           </div>
           <div class="field">
@@ -744,6 +742,69 @@
 
   // ---------- 登录 / 登出 ----------
 
+  /**
+   * 把当前身份的限额应用到「生成卡密」表单。
+   *
+   * ⚠️ 前端设的 max 只是提示，真正的防线在服务端 ——
+   *    直接构造请求就能绕过这里。之所以还要设，是为了让用户在
+   *    点「生成」之前就知道自己最多能设多少，而不是提交后才被拒。
+   */
+  function applyLimits() {
+    var lim = state.me && state.me.limits;
+    var bar = $("genLimitHint");
+    var btn = $("btnGen");
+
+    if (!lim || !lim.canGenerate) {
+      if (bar) {
+        bar.className = "warnbox";
+        bar.textContent = "当前身份不能生成卡密，只能查看。";
+      }
+      if (btn) btn.disabled = true;
+      return;
+    }
+    if (btn) btn.disabled = false;
+
+    var fields = [
+      ["gCount", lim.maxGenerateCount],
+      ["gDevices", lim.maxDevices],
+      ["gActivations", lim.maxActivations],
+      ["gDays", lim.maxActivationDays],
+      ["gUnbinds", lim.maxUnbinds],
+    ];
+    fields.forEach(function (f) {
+      var el = $(f[0]);
+      if (!el) return;
+      el.max = String(f[1]);
+      // 当前值超限就直接压到上限，免得点了生成才被拒
+      if (Number(el.value) > f[1]) el.value = String(f[1]);
+    });
+
+    // 永久卡密只有账户登录能发 —— 提示写在 placeholder 里，
+    // 因为「留空=不限」这个语义本身就藏在 placeholder 上
+    var expEl = $("gExpires");
+    if (expEl) {
+      if (lim.allowUnlimitedExpiry) {
+        expEl.placeholder = "不限";
+      } else {
+        expEl.placeholder = "必填 · 当前身份不能发永久卡密";
+        // 给个默认值。否则用户直接点「生成」会被拒，
+        // 而他并不知道"留空"在这里等于"永久"。
+        if (expEl.value.trim() === "") expEl.value = "365";
+      }
+    }
+
+    if (bar) {
+      bar.className = "hint";
+      bar.textContent =
+        "当前身份上限 — 数量 ≤ " + lim.maxGenerateCount +
+        " · 设备 ≤ " + lim.maxDevices +
+        " · 激活 ≤ " + lim.maxActivations +
+        " · 授予天数 ≤ " + lim.maxActivationDays +
+        " · 解绑 ≤ " + lim.maxUnbinds +
+        (lim.allowUnlimitedExpiry ? " · 可发永久卡密" : " · 不能发永久卡密");
+    }
+  }
+
   function showApp() {
     $("loginScreen").hidden = true;
     $("app").hidden = false;
@@ -766,6 +827,44 @@
 
     // 页签刚变可见，这时候才量得到真实高度（隐藏时 offsetHeight 为 0）
     syncStickyOffsets();
+
+    // 角色下拉与限额提示都依赖 /me 的返回，必须等登录后再构建
+    buildRoleOptions();
+    applyLimits();
+  }
+
+  /** 构建「签发管理员令牌」的角色下拉。等级列表来自服务端，前端不硬编码 */
+  function buildRoleOptions() {
+    var roles = (state.me && state.me.roles) || [];
+    var sel = $("tRole");
+    if (!sel) return;
+
+    sel.innerHTML = "";
+    roles.forEach(function (r) {
+      var o = document.createElement("option");
+      o.value = r.value;
+      o.textContent = r.label + " — " + r.desc;
+      sel.appendChild(o);
+    });
+
+    // 默认停在「运营」——最常用的等级
+    sel.value = roles.some(function (r) { return r.value === "operator"; })
+      ? "operator"
+      : (roles[0] ? roles[0].value : "");
+
+    // 令牌列表的等级筛选也照同一份列表生成，避免加等级时漏改
+    var tkRole = $("tkRole");
+    if (tkRole) {
+      var keep = tkRole.value;
+      tkRole.innerHTML = '<option value="">全部等级</option>';
+      roles.forEach(function (r) {
+        var o = document.createElement("option");
+        o.value = r.value;
+        o.textContent = r.label;
+        tkRole.appendChild(o);
+      });
+      tkRole.value = keep;
+    }
   }
 
   function showLogin() {
@@ -1392,7 +1491,11 @@
 
   // ---------- 管理员令牌 ----------
 
-  var ROLE_LABEL = { root: "管理", operator: "运营", readonly: "只读" };
+  var ROLE_LABEL = {
+    root_plus: "管理+", root: "管理",
+    operator_plus: "运营+", operator: "运营",
+    readonly: "只读",
+  };
 
   function tokenState(t) {
     if (t.revoked) return { text: "已撤销", cls: "disabled" };
@@ -1886,30 +1989,13 @@
   }
 
   (async function init() {
-    // 角色下拉与说明。
-    // ⚠️ 这里是**可下发的 3 个等级**，不包含能签发令牌的账户会话 ——
-    //    令牌一律不能签发令牌，否则一次泄露就能无限复制权限。
-    //    划分依据是「操作可不可逆」：
-    //      只读 → 看
-    //      运营 → 只做可逆的日常操作（发卡、解绑、催校验）
-    //      管理 → 才允许破坏性操作（封禁用户、增删改软件）
-    var roles = [
-      { value: "readonly", label: "只读", desc: "只能查看卡密、软件、日志与统计，不能做任何修改" },
-      { value: "operator", label: "运营", desc: "可生成卡密、解绑设备、下发强制校验；不能封禁用户，也不能增删改软件" },
-      { value: "root", label: "管理", desc: "运营的全部权限，另可封禁/解封卡密、增删改软件；但仍不能签发令牌" },
-    ];
-    var sel = $("tRole");
-    roles.forEach(function (r) {
-      var o = document.createElement("option");
-      o.value = r.value;
-      o.textContent = r.label + " — " + r.desc;
-      sel.appendChild(o);
-    });
-    sel.value = "operator";
+    // 角色下拉在 showApp() 里构建（依赖 /me 返回的等级列表）。
+    // 这里只放不依赖登录状态的静态说明。
     $("tokenRoleHint").innerHTML =
       "<strong>令牌一律不能签发令牌</strong> —— 只有账户密码登录能签发，" +
       "防止一次泄露后权限被无限复制。<br>" +
-      "所以最高一级令牌叫「管理」而不是「最高权限」—— 它拿不到签发令牌的能力。" +
+      "等级按「操作可不可逆」+「卡密参数上限」两条线划分，" +
+      "所以最高一级叫「管理+」而不是「最高权限」—— 它拿不到签发令牌的能力。" +
       "默认有效期 30 分钟。";
 
     var saved = localStorage.getItem("licenseAdminToken");

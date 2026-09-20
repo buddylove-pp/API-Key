@@ -15,6 +15,26 @@ import { createRepo } from "./repo.js";
 import { LicenseService } from "./service.js";
 import { buildRouter, MAX_BODY } from "./routes.js";
 
+/**
+ * 给 Promise 加超时。超时返回 null，**原 Promise 继续在后台跑**。
+ *
+ * 用在这里是为了让「建表」不会无限拖住启动 ——
+ * 数据库不可达时逐条执行 schema 每条各等一次连接超时，几分钟就过去了。
+ */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    // 不要因为这个定时器把进程钉住不退出
+    timer.unref?.();
+  });
+
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function main(): Promise<void> {
   validateConfig();
 
@@ -26,13 +46,40 @@ async function main(): Promise<void> {
   // 建表/连库失败不直接退出：让进程活着，/health 会报出真实原因。
   // 否则容器一崩，平台只会给一句 "App check failed"，根因完全看不到。
   let initError: string | null = null;
+  /** 建表是否真的成功了。看门狗靠它判断要不要补建 */
+  let schemaReady = false;
+
   if (config.autoMigrate) {
-    try {
-      await repo.init();
-      console.log("[db] 建表完成");
-    } catch (e) {
-      initError = e instanceof Error ? e.message : String(e);
+    const startedAt = Date.now();
+
+    // ⚠️ 必须有总超时：数据库不可达时逐条执行 schema 会每条各等一次
+    //    连接超时，几十条语句就是好几分钟 —— 容器会启动超时、部署直接失败。
+    const ok = await withTimeout(
+      (async (): Promise<boolean> => {
+        try {
+          await repo.init();
+          // 即使外层已经超时返回，这里也要置位 ——
+          // 建表在后台跑完了就该认，否则看门狗会白补一次
+          schemaReady = true;
+          initError = null;
+          return true;
+        } catch (e) {
+          initError = e instanceof Error ? e.message : String(e);
+          return false;
+        }
+      })(),
+      config.dbInitTimeoutSec * 1000,
+    );
+
+    if (ok === true) {
+      console.log(`[db] 建表完成（${Date.now() - startedAt} ms）`);
+    } else if (ok === false) {
       console.error("[db] 建表失败:", initError);
+      console.error("[db] 已降级启动，看门狗会在数据库恢复后自动补建表");
+    } else {
+      initError = `建表超时（超过 ${config.dbInitTimeoutSec} 秒），已降级启动`;
+      console.error("[db]", initError);
+      console.error("[db] 看门狗会在数据库恢复后自动补建表，无需重启容器");
     }
   }
 
@@ -41,9 +88,17 @@ async function main(): Promise<void> {
   // 首次启动时种下 root 账户（已有账户则跳过，不会覆盖密码）
   if (config.adminUsername !== "" && config.adminPassword !== "") {
     try {
-      const created = await service.ensureRootUser(config.adminUsername, config.adminPassword);
-      if (created) {
+      // 同样要加超时：数据库不可达时这里也会等满连接超时，
+      // 把启动又拖长 10 秒 —— 光给建表加超时是不够的。
+      const created = await withTimeout(
+        service.ensureRootUser(config.adminUsername, config.adminPassword),
+        config.dbInitTimeoutSec * 1000,
+      );
+
+      if (created === true) {
         console.log(`[auth] 已创建 root 账户「${config.adminUsername}」`);
+      } else if (created === null) {
+        console.warn("[auth] 初始化 root 账户超时，跳过（不影响启动，可稍后手动处理）");
       }
     } catch (e) {
       console.error("[auth] 创建 root 账户失败:", e instanceof Error ? e.message : e);
@@ -131,6 +186,21 @@ async function main(): Promise<void> {
       void (async () => {
         try {
           await service.ping();
+
+          // 数据库回来了，但建表可能还没成功（启动时超时降级了）。
+          // schema 是 CREATE TABLE IF NOT EXISTS，重复执行安全。
+          if (!schemaReady && config.autoMigrate) {
+            console.log("[db] 数据库已恢复，补建表…");
+            try {
+              await repo.init();
+              schemaReady = true;
+              initError = null;
+              console.log("[db] 建表完成，服务已恢复");
+            } catch (e) {
+              console.warn("[db] 补建表失败，下轮再试:", e instanceof Error ? e.message : e);
+            }
+          }
+
           if (fails > 0) {
             console.log(`[db] 探活恢复正常（此前连续失败 ${fails} 次）`);
             fails = 0;

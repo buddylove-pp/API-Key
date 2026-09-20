@@ -550,7 +550,8 @@ async function run() {
     check("★ 静态 ADMIN_TOKEN 也无法签发令牌（403）", staticMk.status === 403, `HTTP ${staticMk.status}`);
 
     const rootGen = await api("/admin/v1/licenses/generate", {
-      token: rootToken, body: { product: PRODUCT, count: 1 },
+      // 令牌身份不能发永久卡密，必须带有效期
+      token: rootToken, body: { product: PRODUCT, count: 1, expires_in_days: 30 },
     });
     check("root 令牌仍可发卡（业务权限不受影响）", rootGen.json?.code === 0, JSON.stringify(rootGen.json));
 
@@ -576,7 +577,9 @@ async function run() {
     check("可签发运营令牌", typeof opToken === "string", JSON.stringify(opTok.json));
 
     const opGen = await api("/admin/v1/licenses/generate", {
-      token: opToken, body: { product: PRODUCT, count: 1 },
+      // 运营的限额比管理低：授予天数上限 90 天，所以不能沿用默认的 365
+      token: opToken,
+      body: { product: PRODUCT, count: 1, expires_in_days: 30, activation_days: 30 },
     });
     check("运营令牌可发卡（可逆操作）", opGen.json?.code === 0, JSON.stringify(opGen.json));
 
@@ -1122,6 +1125,99 @@ async function run() {
       if (r.data?.db_reachable !== true) allOk = false;
     }
     check("★ 连续探活都成功（真查询而非缓存）", allOk);
+  }
+
+  section("23. 角色分级与限额");
+  {
+    const me = await rawGet("/api/v1/admin/me", ADMIN_TOKEN);
+    const roleList = me.json?.data?.roles ?? [];
+    check("★ 返回 5 个可签发等级",
+      roleList.map((r) => r.value).join(",") === "readonly,operator,operator_plus,root,root_plus",
+      roleList.map((r) => r.value).join(","));
+    check("每个等级都带限额",
+      roleList.length === 5 && roleList.every((r) => r.limits && typeof r.limits.maxDevices === "number"));
+
+    const L = {};
+    roleList.forEach((r) => { L[r.value] = r.limits; });
+
+    check("★ 设备数上限逐级递增",
+      L.readonly.maxDevices < L.operator.maxDevices &&
+      L.operator.maxDevices < L.operator_plus.maxDevices &&
+      L.operator_plus.maxDevices < L.root.maxDevices &&
+      L.root.maxDevices < L.root_plus.maxDevices,
+      JSON.stringify(Object.keys(L).map((k) => [k, L[k].maxDevices])));
+
+    check("★ 授予天数上限逐级递增",
+      L.operator.maxActivationDays < L.operator_plus.maxActivationDays &&
+      L.operator_plus.maxActivationDays < L.root.maxActivationDays &&
+      L.root.maxActivationDays < L.root_plus.maxActivationDays,
+      JSON.stringify(Object.keys(L).map((k) => [k, L[k].maxActivationDays])));
+
+    check("只读不能发卡", L.readonly.canGenerate === false, JSON.stringify(L.readonly));
+
+    check("★ 令牌等级一律不能发永久卡密",
+      ["operator", "operator_plus", "root", "root_plus"].every((r) => L[r].allowUnlimitedExpiry === false));
+
+    check("★ 令牌等级一律不能签发令牌",
+      ["operator", "operator_plus", "root", "root_plus"].every((r) => L[r].maxTokenTtlSeconds === 0));
+
+    check("账户登录可发永久卡密", me.json?.data?.limits?.allowUnlimitedExpiry === true);
+
+    // ---- 限额真的生效吗 ----
+    const login = await rawPost("/api/v1/admin/login", {
+      username: ADMIN_USER, password: "new-password-9876",
+    });
+    const sess = login.json?.data?.token;
+    const mk = async (role) =>
+      (await api("/admin/v1/tokens", { token: sess, body: { role, ttl_seconds: 1800 } }))
+        .json?.data?.token;
+
+    const opTok = await mk("operator");
+    const opPlusTok = await mk("operator_plus");
+    const rootPlusTok = await mk("root_plus");
+
+    const unl = await api("/admin/v1/licenses/generate", {
+      token: rootPlusTok, body: { product: PRODUCT, count: 1 },
+    });
+    check("★ 管理+ 令牌不能发永久卡密（400）", unl.status === 400, `HTTP ${unl.status} ${JSON.stringify(unl.json)}`);
+
+    const over = await api("/admin/v1/licenses/generate", {
+      token: opTok,
+      body: { product: PRODUCT, count: 1, expires_in_days: 30, max_devices: 9 },
+    });
+    check("★ 运营令牌设备数超限被拒（400）", over.status === 400, `HTTP ${over.status}`);
+    check("报错说清了是哪个参数", String(over.json?.msg ?? "").includes("同时绑定设备数"), over.json?.msg);
+
+    const opPlus2 = await api("/admin/v1/licenses/generate", {
+      token: opPlusTok,
+      body: { product: PRODUCT, count: 1, expires_in_days: 30, max_devices: 2, activation_days: 100 },
+    });
+    check("★ 运营+ 能设 2 台设备（运营只能 1 台）", opPlus2.json?.code === 0, JSON.stringify(opPlus2.json));
+
+    // ---- 删除卡密：管理不行，管理+ 行 ----
+    const g = await api("/admin/v1/licenses/generate", {
+      token: ADMIN_TOKEN, body: { product: PRODUCT, count: 1 },
+    });
+    const k = g.json?.data?.keys?.[0];
+
+    const rootDel = await api("/admin/v1/licenses/delete", {
+      token: await mk("root"), body: { keys: [k] },
+    });
+    check("★ 管理令牌不能删除卡密（403）", rootDel.status === 403, `HTTP ${rootDel.status}`);
+
+    const rootPlusDel = await api("/admin/v1/licenses/delete", {
+      token: rootPlusTok, body: { keys: [k] },
+    });
+    check("★ 管理+ 令牌可以删除卡密", rootPlusDel.json?.code === 0, JSON.stringify(rootPlusDel.json));
+
+    // ---- 标签 ----
+    const meOp = await rawGet("/api/v1/admin/me", opTok);
+    check("运营令牌标签为「运营」", meOp.json?.data?.role_label === "运营", meOp.json?.data?.role_label);
+    const meOpPlus = await rawGet("/api/v1/admin/me", opPlusTok);
+    check("★ 运营+ 令牌标签为「运营+」", meOpPlus.json?.data?.role_label === "运营+", meOpPlus.json?.data?.role_label);
+    const meRootPlus = await rawGet("/api/v1/admin/me", rootPlusTok);
+    check("★ 管理+ 令牌标签为「管理+」", meRootPlus.json?.data?.role_label === "管理+", meRootPlus.json?.data?.role_label);
+    check("★ 管理+ 仍不能签发令牌", meRootPlus.json?.data?.can_manage_tokens === false);
   }
 
   // ============ 汇总 ============

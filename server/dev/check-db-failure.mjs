@@ -23,6 +23,8 @@ const child = spawn(process.execPath, ["dist/index.js"], {
     ADMIN_TOKEN: "wd_test_token_0123456789abcdefghijkl",
     TICKET_PRIVATE_KEY_PEM: privateKeyPem,
     DB_WATCHDOG_SEC: "2",
+    // 建表总超时压到 5 秒，否则要等几十条语句各超时一次
+    DB_INIT_TIMEOUT_SEC: "5",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -31,8 +33,28 @@ let out = "";
 child.stdout.on("data", (d) => { out += String(d); });
 child.stderr.on("data", (d) => { out += String(d); });
 
-// 等够两轮看门狗周期
-await new Promise((r) => setTimeout(r, 9000));
+// ── 关键测量：数据库不可达时，服务多久能被访问到 ──
+// 修复前：逐条执行 schema 每条各等一次连接超时，几分钟都起不来。
+// 修复后：受 DB_INIT_TIMEOUT_SEC 约束，超时就降级启动。
+const spawnAt = Date.now();
+let readyMs = -1;
+for (let i = 0; i < 80; i++) {
+  await new Promise((r) => setTimeout(r, 500));
+  const ok = await fetch("http://127.0.0.1:18092/health")
+    .then((x) => x.ok)
+    .catch(() => false);
+  if (ok) {
+    readyMs = Date.now() - spawnAt;
+    break;
+  }
+}
+console.log(`  数据库不可达时，服务在 ${readyMs} ms 后即可访问（上限 ${5_000}ms + 余量）`);
+console.log();
+
+// 等够两轮看门狗周期。
+// 注意：数据库不可达时每次 ping 自己要等 10 秒连接超时，
+// 所以「连续两次失败」实际需要 ~20 秒，不是 2×2 秒。
+await new Promise((r) => setTimeout(r, 26_000));
 
 const probe = await fetch("http://127.0.0.1:18092/health")
   .then(async (x) => ({ status: x.status, json: await x.json() }))

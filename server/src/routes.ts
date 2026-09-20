@@ -10,10 +10,13 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { keyFingerprint, publicKeyToPem, isValidDeviceFp } from "./crypto.js";
 import type { KeyObject } from "node:crypto";
 import {
+  ISSUABLE_ROLES,
   MAX_TOKEN_TTL_SECONDS,
   ROLE_DESC,
   ROLE_LABEL,
+  ROLE_LIMITS,
   isAdminRole,
+  limitsFor,
   roleAtLeast,
   type AdminIdentity,
   type AdminRole,
@@ -51,6 +54,17 @@ function clientIp(req: Request): string | null {
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+}
+
+/**
+ * 参数超限时返回一句给人看的提示，未超限返回 null。
+ * 用「返回提示」而不是「抛异常」，是为了把四项检查串成一行 ?? 链，
+ * 报错信息还能带上具体是哪个参数超了多少。
+ */
+function checkLimit(label: string, value: number, max: number): string | null {
+  if (!Number.isFinite(value) || value < 0) return `${label} 不合法`;
+  if (value > max) return `${label} 最多 ${max}（请求 ${value}）`;
+  return null;
 }
 
 /**
@@ -256,7 +270,9 @@ export function buildRouter(deps: RouterDeps): Router {
 
     const givenBuf = Buffer.from(raw, "utf8");
     if (givenBuf.length === staticTokenBuf.length && timingSafeEqual(givenBuf, staticTokenBuf)) {
-      return { name: "静态管理令牌", role: "root", source: "static" };
+      // 静态令牌是最高的应急凭据：数据库出问题时靠它救急，
+      // 所以给最高等级，否则连"删掉一张发错的卡密"都做不到。
+      return { name: "静态管理令牌", role: "root_plus", source: "static" };
     }
     return service.resolveToken(raw);
   }
@@ -365,6 +381,7 @@ export function buildRouter(deps: RouterDeps): Router {
     // 账户登录是最高的第 4 级，标签要与管理令牌区分开 ——
     // 否则用户会以为手里的 root 令牌和账户一样能签发令牌。
     const isAccount = id.source === "account";
+    const limits = limitsFor(id);
 
     ok(res, {
       ...id,
@@ -375,9 +392,12 @@ export function buildRouter(deps: RouterDeps): Router {
       /** 只有账户密码登录能管理令牌 —— 令牌不能派生令牌 */
       can_manage_tokens: isAccount && id.role === "root",
       can_change_password: isAccount,
-      max_token_ttl_seconds: MAX_TOKEN_TTL_SECONDS,
-      roles: (["readonly", "operator", "root"] as AdminRole[]).map((r) => ({
+      max_token_ttl_seconds: limits.maxTokenTtlSeconds,
+      /** 当前身份能设的最大值。前端据此设 max 属性并给出提示 */
+      limits,
+      roles: ISSUABLE_ROLES.map((r) => ({
         value: r, label: ROLE_LABEL[r], desc: ROLE_DESC[r],
+        limits: ROLE_LIMITS[r],
       })),
     });
   }));
@@ -401,10 +421,7 @@ export function buildRouter(deps: RouterDeps): Router {
 
     const kind =
       kindRaw === "session" || kindRaw === "issued" ? kindRaw : undefined;
-    const role =
-      roleRaw === "root" || roleRaw === "operator" || roleRaw === "readonly"
-        ? roleRaw
-        : undefined;
+    const role = roleRaw !== null && isAdminRole(roleRaw) ? roleRaw : undefined;
     const state =
       stateRaw === "active" || stateRaw === "revoked" || stateRaw === "expired"
         ? stateRaw
@@ -435,11 +452,26 @@ export function buildRouter(deps: RouterDeps): Router {
   admin.post("/tokens", requireAccount, wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const identity = (req as AuthedRequest).admin!;
+    const limits = limitsFor(identity);
 
     const role = body["role"];
     if (!isAdminRole(role)) throw new ServiceError(ErrCode.INVALID_PARAM);
 
+    // 令牌有效期上限由**签发者身份**决定。
+    // 账户登录实际上不设限；令牌登录根本走不到这里（requireAccount 挡着），
+    // 但限额仍然配好 —— 万一以后放开令牌签发，这一层不用再改。
+    const cap = limits.maxTokenTtlSeconds > 0 ? limits.maxTokenTtlSeconds : MAX_TOKEN_TTL_SECONDS;
     const ttl = Number(body["ttl_seconds"] ?? 1800);
+
+    if (!Number.isFinite(ttl) || ttl < 60) {
+      fail(res, 4001, "令牌有效期至少 60 秒", 400);
+      return;
+    }
+    if (ttl > cap) {
+      fail(res, 4001, `当前身份签发的令牌有效期最多 ${Math.floor(cap / 86400)} 天`, 400);
+      return;
+    }
+
     const result = await service.createAdminToken(
       role, str(body["name"]), ttl, identity.name,
     );
@@ -510,25 +542,62 @@ export function buildRouter(deps: RouterDeps): Router {
   /** 批量生成卡密 */
   admin.post("/licenses/generate", requireAuth("operator"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
+    const identity = (req as AuthedRequest).admin!;
+    const limits = limitsFor(identity);
+
+    if (!limits.canGenerate) {
+      fail(res, 4030, "当前身份不能生成卡密", 403);
+      return;
+    }
+
     const count = Number(body["count"] ?? 1);
-    if (!Number.isInteger(count) || count < 1 || count > 1000) {
+    if (!Number.isInteger(count) || count < 1) {
       throw new ServiceError(ErrCode.INVALID_PARAM);
+    }
+    if (count > limits.maxGenerateCount) {
+      fail(res, 4001, `当前身份一次最多生成 ${limits.maxGenerateCount} 张（请求 ${count} 张）`, 400);
+      return;
+    }
+
+    // 逐项对照身份限额。前端设的 max 属性只是提示，真正的防线在这里 ——
+    // 直接构造请求就能绕过前端限制。
+    const maxDevices = Number(body["max_devices"] ?? 1);
+    const maxActivations = Number(body["max_activations"] ?? 1);
+    const activationDays = Number(body["activation_days"] ?? 365);
+    const maxUnbinds = Number(body["max_unbinds"] ?? 3);
+
+    const overLimit =
+      checkLimit("同时绑定设备数", maxDevices, limits.maxDevices) ??
+      checkLimit("可激活次数", maxActivations, limits.maxActivations) ??
+      checkLimit("每次激活授予天数", activationDays, limits.maxActivationDays) ??
+      checkLimit("可解绑次数", maxUnbinds, limits.maxUnbinds);
+
+    if (overLimit !== null) {
+      fail(res, 4001, overLimit, 400);
+      return;
+    }
+
+    // 「卡密绝对有效期」留空 = 永久有效。这是最有价值的一种卡密，
+    // 只有账户密码登录能发 —— 下级令牌最多发有期限的。
+    const expiresRaw = body["expires_in_days"];
+    const unlimited = expiresRaw === null || expiresRaw === undefined;
+    if (unlimited && !limits.allowUnlimitedExpiry) {
+      fail(res, 4001, "当前身份不能生成永久有效的卡密，请填写有效天数", 400);
+      return;
     }
 
     const keys = await service.generate(count, {
       product: str(body["product"]) ?? "default",
-      max_devices: Number(body["max_devices"] ?? 1),
-      max_activations: Number(body["max_activations"] ?? 1),
-      activation_days: Number(body["activation_days"] ?? 365),
-      max_unbinds: Number(body["max_unbinds"] ?? 3),
+      max_devices: maxDevices,
+      max_activations: maxActivations,
+      activation_days: activationDays,
+      max_unbinds: maxUnbinds,
       refund_on_unbind: body["refund_on_unbind"] !== false,
       check_mode: body["check_mode"] === "interval" ? "interval" : "frequency",
       check_frequency: Number(body["check_frequency"] ?? 1),
       check_interval_days: Number(body["check_interval_days"] ?? 0),
       check_remind_percent: Number(body["check_remind_percent"] ?? 20),
-      expires_in_days: body["expires_in_days"] === null || body["expires_in_days"] === undefined
-        ? null
-        : Number(body["expires_in_days"]),
+      expires_in_days: unlimited ? null : Number(expiresRaw),
       note: str(body["note"]),
     });
 
@@ -559,10 +628,11 @@ export function buildRouter(deps: RouterDeps): Router {
   /**
    * 批量删除卡密（彻底删除，不可恢复）。
    *
-   * 需要 root 权限 —— 这是不可逆的破坏性操作。
+   * 需要 root_plus —— 这是**不可逆**的破坏性操作，
+   * 比「封禁」更狠：封禁能解封，删除找不回来。
    * 支持传完整卡密或唯一前缀；前缀歧义的会被跳过并列在 notFound 里，不猜。
    */
-  admin.post("/licenses/delete", requireAuth("root"), wrap(async (req, res) => {
+  admin.post("/licenses/delete", requireAuth("root_plus"), wrap(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const raw = body["keys"];
 
