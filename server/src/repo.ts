@@ -223,6 +223,14 @@ export function isLicenseExpired(row: LicenseRow, now: number): boolean {
 
 export interface Repo {
   init(): Promise<void>;
+  /**
+   * 探活：真实执行一次查询确认连接可用。
+   *
+   * 为什么需要它：init() 只在启动时跑一次，之后连接可能被服务端、
+   * 负载均衡或防火墙悄悄断开，而进程自己不知道 ——
+   * 表现出来就是所有接口 500、但 /health 还报 "up"。
+   */
+  ping(): Promise<void>;
   close(): Promise<void>;
 
   createLicense(input: CreateLicenseInput): Promise<LicenseRow>;
@@ -334,6 +342,11 @@ export class MemoryRepo implements Repo {
   }
 
   async close(): Promise<void> {}
+
+  /** 内存实现没有外部依赖，永远可用 */
+  async ping(): Promise<void> {
+    return;
+  }
 
   async createLicense(input: CreateLicenseInput): Promise<LicenseRow> {
     const row: LicenseRow = {
@@ -707,13 +720,25 @@ export class PgRepo implements Repo {
   }
 
   private makePool(connectionString: string, ssl: boolean): pg.Pool {
-    return new pg.Pool({
+    const pool = new pg.Pool({
       connectionString,
       max: 5,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
       ssl: ssl ? { rejectUnauthorized: false } : false,
+      // 开启 TCP 保活。托管数据库和中间的负载均衡 / 防火墙经常**静默断开**
+      // 空闲连接，而客户端不知道 —— 下次从池里拿到死连接就直接报错。
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
     });
+
+    // 池里的空闲连接被服务端断开时 pg 会 emit 'error'。
+    // 不监听的话 Node 会当成未捕获异常，直接干掉整个进程。
+    pool.on("error", (err: Error) => {
+      console.warn(`[db] 空闲连接出错（已丢弃，下次请求自动重连）：${err.message}`);
+    });
+
+    return pool;
   }
 
   async init(): Promise<void> {
@@ -777,6 +802,10 @@ export class PgRepo implements Repo {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  async ping(): Promise<void> {
+    await this.pool.query("SELECT 1");
   }
 
   async createLicense(input: CreateLicenseInput): Promise<LicenseRow> {

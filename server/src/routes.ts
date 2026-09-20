@@ -53,6 +53,22 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
 }
 
+/**
+ * 把数据库错误压成一句可对外公开的说明。
+ *
+ * 必须剥掉连接串 —— pg 的报错里经常带着 host / user / password，
+ * 直接透到 /health 上等于把数据库凭据公开了。
+ */
+function sanitizeDbError(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  return raw
+    .replace(/(postgres(?:ql)?:\/\/)[^\s]+/gi, "$1***")
+    .replace(/(password|passwd|pwd)\s*=\s*[^\s;]+/gi, "$1=***")
+    .replace(/(user|username)\s*=\s*[^\s;]+/gi, "$1=***")
+    .replace(/(host|hostname)\s*=\s*[^\s;]+/gi, "$1=***")
+    .slice(0, 300);
+}
+
 function ctxOf(req: Request, body: Record<string, unknown>): CallContext {
   return { ip: clientIp(req), appVersion: str(body["app_version"]) };
 }
@@ -84,10 +100,24 @@ export function buildRouter(deps: RouterDeps): Router {
 
   // ============ 基础 ============
 
-  router.get("/health", (_req, res) => {
+  router.get("/health", async (_req, res) => {
     const extra = deps.health?.() ?? {};
     const initError = extra["init_error"];
-    const degraded = typeof initError === "string" && initError !== "";
+    const startupDegraded = typeof initError === "string" && initError !== "";
+
+    // 真实探活。init() 只在启动时跑一次，之后连接可能被数据库、
+    // 负载均衡或防火墙悄悄断开，而进程自己不知道 ——
+    // 表现出来就是所有接口 500、但 /health 还报 "up"（曾经真实发生过）。
+    let dbUp = true;
+    let dbError: string | null = null;
+    try {
+      await deps.service.ping();
+    } catch (e) {
+      dbUp = false;
+      dbError = sanitizeDbError(e);
+    }
+
+    const degraded = startupDegraded || !dbUp;
 
     // 即使数据库不可用也返回 200：让平台的应用检查通过，
     // 这样才有机会从 /health 读到真实故障原因，而不是只拿到一句 "App check failed"
@@ -95,6 +125,8 @@ export function buildRouter(deps: RouterDeps): Router {
       status: degraded ? "degraded" : "up",
       server_time: Math.floor(Date.now() / 1000),
       ...extra,
+      db_reachable: dbUp,
+      db_error: dbError,
     });
   });
 

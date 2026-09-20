@@ -883,6 +883,11 @@ export class LicenseService {
     return { deleted, notFound, bindings };
   }
 
+  /** 探活：供 /health 做真实的连接检查 */
+  async ping(): Promise<void> {
+    await this.repo.ping();
+  }
+
   async setStatus(lic: LicenseRow, status: "unused" | "active" | "banned", ctx: CallContext): Promise<void> {
     await this.repo.setLicenseStatus(lic.id, status);
     await this.repo.audit({
