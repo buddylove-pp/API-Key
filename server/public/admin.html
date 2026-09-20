@@ -95,6 +95,43 @@
   .tabs{display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap}
   .tabs button{border-radius:6px}
   .tabs button.on{background:var(--accent); color:#fff; border-color:var(--accent)}
+
+  /* ============ 吸顶 ============
+     往下滚表格时，页签和筛选栏固定在顶部，随时能改条件 ——
+     否则滚到第 30 行想换个筛选条件得一路滚回最上面。
+
+     ⚠️ sticky 只对「最近的滚动祖先」生效。body 没有 overflow 限制，
+        所以这里能正常工作；如果以后给 body/main 加 overflow:hidden，
+        吸顶会立刻失效。
+
+     页签高度会随换行变化，所以 --tabs-h 由 JS 实测后写入，
+     筛选栏用 top:var(--tabs-h) 贴在页签下面。 */
+  .tabs{
+    position:sticky; top:0; z-index:20;
+    background:var(--bg);
+    /* 用负外边距 + 内边距把 main 的 20px 留白也盖住，
+       否则页签两侧会露出底下滚过去的内容 */
+    margin:-10px -20px 16px; padding:10px 20px;
+  }
+  .stickybar{
+    position:sticky; top:var(--tabs-h, 54px); z-index:19;
+    background:var(--panel);
+    /* 只往左右撑满面板内边距，顶部不用负边距 ——
+       否则前面有标题的面板（卡密列表 / 软件列表 / 操作日志）会被压住 */
+    margin-left:-18px; margin-right:-18px;
+    padding:12px 18px;
+    border-bottom:1px solid var(--line);
+  }
+  /* 面板自身有 18px 上内边距，吸顶后那段空白会露出滚过去的内容。
+     用伪元素把背景往上补 18px 盖住它。
+     position:sticky 会建立包含块，所以这里的 absolute 是相对本元素定位。 */
+  .stickybar::before{
+    content:""; position:absolute; left:0; right:0; top:-18px; height:18px;
+    background:var(--panel);
+  }
+  .stickybar .row{margin-bottom:0}
+  /* 筛选栏上面若紧跟标题，吸顶时标题会被盖住，补一点间距 */
+  .stickybar + *{margin-top:0}
   /* hidden 是语义属性：表示"这个元素不渲染"，必须压过任何 display 样式。
      否则 #loginScreen{display:flex} 这类 ID 选择器会盖掉它
      （ID 特异性 1-0-0 > 元素+属性 0-1-1），导致登录屏隐藏不掉、
@@ -319,7 +356,7 @@
     <section id="secList" hidden>
       <div class="panel">
         <h2>卡密列表</h2>
-        <div class="row">
+        <div class="row stickybar">
           <div class="field">
             <label>软件</label>
             <select id="fProduct" style="min-width:200px"></select>
@@ -413,7 +450,7 @@
 
       <div class="panel">
         <h2>软件列表</h2>
-        <div class="row">
+        <div class="row stickybar">
           <div class="field">
             <label>状态</label>
             <select id="pfStatus">
@@ -485,7 +522,7 @@
       </div>
 
       <div class="panel">
-        <div class="row" style="align-items:flex-end;gap:12px;flex-wrap:wrap">
+        <div class="row stickybar" style="align-items:flex-end;gap:12px;flex-wrap:wrap">
           <div class="field">
             <label>查看</label>
             <select id="tkKind" style="min-width:190px">
@@ -541,7 +578,7 @@
         <div class="hint" style="margin-bottom:12px">
           平台的登录记录、令牌操作、卡密操作。登录失败也会记录，便于发现暴力尝试。
         </div>
-        <div class="row">
+        <div class="row stickybar">
           <div class="field">
             <label>事件类型</label>
             <select id="aFilter">
@@ -726,6 +763,9 @@
     // 用令牌登录时这个页签直接不显示，避免误以为可以签发。
     $("tabTokens").hidden = !me.can_manage_tokens;
     $("btnPw").hidden = !me.can_change_password;
+
+    // 页签刚变可见，这时候才量得到真实高度（隐藏时 offsetHeight 为 0）
+    syncStickyOffsets();
   }
 
   function showLogin() {
@@ -1833,6 +1873,18 @@
 
   // ---------- 初始化 ----------
 
+  /**
+   * 同步吸顶偏移量。
+   *
+   * 页签会随窗口宽度换行，高度不是固定值 ——
+   * 筛选栏的 top 必须跟着变，否则要么盖住页签、要么中间露一条缝。
+   */
+  function syncStickyOffsets() {
+    var tabs = document.querySelector(".tabs");
+    if (!tabs) return;
+    document.documentElement.style.setProperty("--tabs-h", tabs.offsetHeight + "px");
+  }
+
   (async function init() {
     // 角色下拉与说明。
     // ⚠️ 这里是**可下发的 3 个等级**，不包含能签发令牌的账户会话 ——
@@ -1866,6 +1918,10 @@
     } else {
       showLogin();
     }
+
+    // 吸顶偏移量：初次量一次，之后窗口尺寸变化（含页签换行）时重算
+    syncStickyOffsets();
+    window.addEventListener("resize", syncStickyOffsets);
   })();
 })();
 </script>
